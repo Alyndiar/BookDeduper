@@ -42,6 +42,14 @@ class ReviewTab(QWidget):
         self.btn_save_checks.clicked.connect(self.save_checks)
         btnrow.addWidget(self.btn_save_checks)
 
+        self.btn_skip_work = QPushButton("Skip work")
+        self.btn_skip_work.clicked.connect(self.skip_current_work)
+        btnrow.addWidget(self.btn_skip_work)
+
+        self.btn_invalid_author = QPushButton("Invalid Author Detected")
+        self.btn_invalid_author.clicked.connect(self.mark_invalid_author_for_work)
+        btnrow.addWidget(self.btn_invalid_author)
+
         self.btn_delete = QPushButton("Delete checked (Recycle Bin)")
         self.btn_delete.clicked.connect(self.delete_checked_files)
         btnrow.addWidget(self.btn_delete)
@@ -151,6 +159,67 @@ class ReviewTab(QWidget):
             QMessageBox.critical(self, "Save", f"Failed:\n{e!r}")
             return
         QMessageBox.information(self, "Save", "Checkmarks saved.")
+
+
+    def skip_current_work(self):
+        db = self.get_db()
+        if not db or not self.current_work_key:
+            return
+        db.execute(
+            "UPDATE deletion_queue SET checked=0, reason='SKIP (manual)' WHERE work_key=?",
+            (self.current_work_key,),
+        )
+        self.load_work(self.current_work_key)
+
+    def mark_invalid_author_for_work(self):
+        db = self.get_db()
+        if not db or not self.current_work_key:
+            return
+        rows = db.query_all(
+            """
+            SELECT DISTINCT f.author_norm, f.author
+            FROM deletion_queue dq
+            JOIN files f ON f.id = dq.file_id
+            WHERE dq.work_key=?
+            """,
+            (self.current_work_key,),
+        )
+        if not rows:
+            return
+        if QMessageBox.question(self, "Invalid Author", "Mark author(s) from this work as invalid and skip deletion for this work?") != QMessageBox.Yes:
+            return
+
+        db.begin()
+        try:
+            for r in rows:
+                author_norm = str(r["author_norm"] or "").strip()
+                author = str(r["author"] or "").strip()
+                if not author_norm or author_norm == "unknown":
+                    continue
+                db.execute(
+                    """
+                    INSERT INTO invalid_authors(normalized_name,canonical_name,reason,updated_at)
+                    VALUES(?,?,?,strftime('%s','now'))
+                    ON CONFLICT(normalized_name) DO UPDATE SET
+                      canonical_name=excluded.canonical_name,
+                      reason='manual-review',
+                      updated_at=excluded.updated_at
+                    """,
+                    (author_norm, author or author_norm, "manual-review"),
+                )
+            db.execute(
+                "UPDATE deletion_queue SET checked=0, reason='SKIP (invalid author)' WHERE work_key=?",
+                (self.current_work_key,),
+            )
+            db.set_state("author_db_dirty", "1")
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            QMessageBox.critical(self, "Invalid Author", f"Failed:\n{e!r}")
+            return
+
+        QMessageBox.information(self, "Invalid Author", "Author(s) marked invalid. Run Analyze again to rebuild author DB.")
+        self.load_work(self.current_work_key)
 
     def delete_checked_files(self):
         db = self.get_db()
