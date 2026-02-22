@@ -5,8 +5,8 @@ from dataclasses import dataclass
 from typing import List, Optional, Dict, Tuple
 from PySide6.QtCore import QObject, Signal
 from .db import DB
-from .util import norm_path, file_sig_from_stat, ext_of, is_probably_archive, dumps, loads, now_ts
-from .parser import parse_filename, detect_quality_tags
+from .util import norm_path, file_sig_from_stat, ext_of, is_probably_archive, dumps, loads, now_ts, normalize_text
+from .parser import parse_filename, detect_quality_tags, make_work_key
 from .sevenzip import detect_7z, list_archive_exts
 
 @dataclass
@@ -157,6 +157,82 @@ class ScanWorker(QObject):
         rows = self.db.query_all("SELECT path,size,mtime_ns FROM files WHERE folder_path=?", (folder_path,))
         return {str(r["path"]): (int(r["size"]), int(r["mtime_ns"])) for r in rows}
 
+
+    def _load_author_aliases(self) -> Dict[str, Tuple[str, str]]:
+        try:
+            rows = self.db.query_all("SELECT alias_norm, author_norm, author_display FROM author_aliases")
+        except Exception:
+            return {}
+        out: Dict[str, Tuple[str, str]] = {}
+        for r in rows:
+            alias_norm = str(r["alias_norm"] or "").strip()
+            author_norm = str(r["author_norm"] or "").strip()
+            author_display = str(r["author_display"] or "").strip()
+            if alias_norm and author_norm and author_display:
+                out[alias_norm] = (author_norm, author_display)
+        return out
+
+    def _candidate_author_aliases(self, filename: str) -> List[str]:
+        stem = os.path.basename(filename)
+        if "." in stem:
+            stem = stem.rsplit(".", 1)[0]
+        candidates: List[str] = []
+        for sep in (" - ", " — ", " – ", "_"):
+            if sep in stem:
+                first = stem.split(sep, 1)[0].strip()
+                if first:
+                    candidates.append(first)
+        if not candidates and stem:
+            candidates.append(stem)
+        out: List[str] = []
+        for c in candidates:
+            norm = normalize_text(c)
+            if norm and norm not in out:
+                out.append(norm)
+        return out
+
+    def _try_correct_author(self, parsed, filename: str, alias_map: Dict[str, Tuple[str, str]]) -> bool:
+        if parsed.author_norm and parsed.author_norm != "unknown":
+            return False
+        for alias_norm in self._candidate_author_aliases(filename):
+            hit = alias_map.get(alias_norm)
+            if not hit:
+                continue
+            corrected_norm, corrected_display = hit
+            parsed.author = corrected_display
+            parsed.author_norm = corrected_norm
+            parsed.work_key = make_work_key(parsed.author_norm, parsed.series_norm, parsed.title_norm, self._series_index_norm(parsed.series_index))
+            return True
+        return False
+
+    def _series_index_norm(self, series_index: Optional[float]) -> str:
+        series_index_norm = ""
+        if series_index is not None:
+            series_index_norm = f"{series_index:05.1f}".lstrip("0")
+            if series_index_norm.startswith("."):
+                series_index_norm = "0" + series_index_norm
+        return series_index_norm
+
+    def _learn_author_alias(self, parsed, alias_map: Dict[str, Tuple[str, str]], ts: int):
+        if not parsed.author_norm or parsed.author_norm == "unknown" or not parsed.author:
+            return
+        alias_norm = normalize_text(parsed.author)
+        if not alias_norm:
+            return
+        if alias_norm not in alias_map:
+            alias_map[alias_norm] = (parsed.author_norm, parsed.author)
+            self.db.execute(
+                """
+                INSERT INTO author_aliases(alias_norm,author_norm,author_display,confidence,source,updated_at)
+                VALUES(?,?,?,?,?,?)
+                ON CONFLICT(alias_norm) DO UPDATE SET
+                  author_norm=excluded.author_norm,
+                  author_display=excluded.author_display,
+                  updated_at=excluded.updated_at
+                """,
+                (alias_norm, parsed.author_norm, parsed.author, 1.0, "derived", ts),
+            )
+
     def _run_scan(self) -> Tuple[bool, str]:
         roots_rows = self.db.query_all("SELECT id,path FROM roots WHERE enabled=1 ORDER BY id")
         roots = [r["path"] for r in roots_rows]
@@ -165,6 +241,7 @@ class ScanWorker(QObject):
 
         scan_id = self._start_scan_run()
         self._ensure_7z()
+        author_aliases = self._load_author_aliases()
 
         stack = self._load_stack(roots)
         stats = {
@@ -255,6 +332,8 @@ class ScanWorker(QObject):
                             stats["files_changed"] += 1
 
                             parsed = parse_filename(name)
+                            self._try_correct_author(parsed, name, author_aliases)
+                            self._learn_author_alias(parsed, author_aliases, now_ts())
                             tags_lower = detect_quality_tags(parsed.tags)
 
                             inner_guess = None
@@ -316,11 +395,7 @@ class ScanWorker(QObject):
                             )
                             existing_by_path[p] = (sig.size, sig.mtime_ns)
 
-                            series_index_norm = ""
-                            if parsed.series_index is not None:
-                                series_index_norm = f"{parsed.series_index:05.1f}".lstrip("0")
-                                if series_index_norm.startswith("."):
-                                    series_index_norm = "0" + series_index_norm
+                            series_index_norm = self._series_index_norm(parsed.series_index)
 
                             self.db.execute(
                                 """

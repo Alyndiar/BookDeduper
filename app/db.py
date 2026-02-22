@@ -2,6 +2,8 @@ from __future__ import annotations
 import sqlite3
 from typing import Iterable, Optional
 
+SCHEMA_VERSION = 2
+
 SCHEMA = r"""
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
@@ -116,6 +118,32 @@ class DB:
             s = stmt.strip()
             if s:
                 cur.execute(s + ";")
+        self._migrate_schema()
+
+    def _migrate_schema(self):
+        raw = self.get_state("schema_version", "1")
+        try:
+            version = int(raw or "1")
+        except Exception:
+            version = 1
+
+        if version < 2:
+            self.execute(
+                """
+                CREATE TABLE IF NOT EXISTS author_aliases(
+                  alias_norm TEXT PRIMARY KEY,
+                  author_norm TEXT NOT NULL,
+                  author_display TEXT NOT NULL,
+                  confidence REAL NOT NULL DEFAULT 1.0,
+                  source TEXT NOT NULL DEFAULT 'derived',
+                  updated_at INTEGER NOT NULL
+                )
+                """
+            )
+            self.execute("CREATE INDEX IF NOT EXISTS idx_author_aliases_author_norm ON author_aliases(author_norm)")
+            version = 2
+
+        self.set_state("schema_version", str(max(version, SCHEMA_VERSION)))
 
     def close(self):
         self.conn.close()
