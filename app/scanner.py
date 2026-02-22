@@ -147,6 +147,16 @@ class ScanWorker(QObject):
         )
         return False
 
+    def _root_id_for_dir(self, current_dir: str, root_pairs: List[Tuple[str, int]]) -> Optional[int]:
+        for rp, rid in root_pairs:
+            if current_dir == rp or current_dir.startswith(rp + os.sep):
+                return rid
+        return None
+
+    def _folder_file_index(self, folder_path: str) -> Dict[str, Tuple[int, int]]:
+        rows = self.db.query_all("SELECT path,size,mtime_ns FROM files WHERE folder_path=?", (folder_path,))
+        return {str(r["path"]): (int(r["size"]), int(r["mtime_ns"])) for r in rows}
+
     def _run_scan(self) -> Tuple[bool, str]:
         roots_rows = self.db.query_all("SELECT id,path FROM roots WHERE enabled=1 ORDER BY id")
         roots = [r["path"] for r in roots_rows]
@@ -171,7 +181,11 @@ class ScanWorker(QObject):
         current_dir = ""
         last_path = ""
 
-        root_id_by_path = {norm_path(r["path"]): int(r["id"]) for r in roots_rows}
+        root_pairs = sorted(
+            ((norm_path(r["path"]), int(r["id"])) for r in roots_rows),
+            key=lambda item: len(item[0]),
+            reverse=True,
+        )
 
         self.db.begin()
         try:
@@ -181,11 +195,7 @@ class ScanWorker(QObject):
                 current_dir = norm_path(current_dir)
                 last_path = current_dir
 
-                root_id = None
-                for rp, rid in root_id_by_path.items():
-                    if current_dir == rp or current_dir.startswith(rp + os.sep):
-                        root_id = rid
-                        break
+                root_id = self._root_id_for_dir(current_dir, root_pairs)
                 if root_id is None:
                     continue
 
@@ -205,6 +215,7 @@ class ScanWorker(QObject):
                     self.progress.emit(f"Scanning: {current_dir}")
 
                 try:
+                    existing_by_path = self._folder_file_index(current_dir)
                     with os.scandir(current_dir) as it:
                         for entry in it:
                             if self._stop:
@@ -235,8 +246,8 @@ class ScanWorker(QObject):
                             sig = file_sig_from_stat(st)
                             ctime_ns = int(getattr(st, "st_ctime_ns", int(st.st_ctime * 1e9)))
 
-                            row = self.db.query_one("SELECT id,size,mtime_ns FROM files WHERE path=?", (p,))
-                            if row and int(row["size"]) == sig.size and int(row["mtime_ns"]) == sig.mtime_ns:
+                            cached_sig = existing_by_path.get(p)
+                            if cached_sig and cached_sig[0] == sig.size and cached_sig[1] == sig.mtime_ns:
                                 self.db.execute("UPDATE files SET last_seen_scan_id=? WHERE path=?", (scan_id, p))
                                 stats["skipped_unchanged"] += 1
                                 continue
@@ -303,6 +314,7 @@ class ScanWorker(QObject):
                                     scan_id
                                 )
                             )
+                            existing_by_path[p] = (sig.size, sig.mtime_ns)
 
                             series_index_norm = ""
                             if parsed.series_index is not None:
