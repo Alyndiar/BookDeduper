@@ -77,7 +77,9 @@ class ProjectTab(QWidget):
             QMessageBox.warning(self, "Project", "Choose a project DB file.")
             return
 
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         try:
             db = DB(path)
         except Exception as e:

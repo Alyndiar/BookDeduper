@@ -16,11 +16,11 @@ def norm_path(p: str) -> str:
 
 def to_long_path(p: str) -> str:
     p = norm_path(p)
-    if p.startswith("\\?\"):
+    if p.startswith("\\\\?\\"):
         return p
-    if p.startswith("\\"):
-        return "\\?\UNC\" + p.lstrip("\")
-    return "\\?\" + p
+    if p.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + p.lstrip("\\")
+    return "\\\\?\\" + p
 
 def dumps(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False)
