@@ -2,7 +2,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Iterable, Optional
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = r"""
 PRAGMA journal_mode=WAL;
@@ -142,6 +142,33 @@ class DB:
             )
             self.execute("CREATE INDEX IF NOT EXISTS idx_author_aliases_author_norm ON author_aliases(author_norm)")
             version = 2
+
+        if version < 3:
+            self.execute(
+                """
+                CREATE TABLE IF NOT EXISTS known_authors(
+                  normalized_name TEXT PRIMARY KEY,
+                  canonical_name TEXT NOT NULL,
+                  frequency INTEGER NOT NULL DEFAULT 0,
+                  created_at INTEGER NOT NULL,
+                  updated_at INTEGER NOT NULL
+                )
+                """
+            )
+            self.execute(
+                """
+                CREATE TABLE IF NOT EXISTS author_variants(
+                  normalized_name TEXT NOT NULL,
+                  variant_text TEXT NOT NULL,
+                  frequency INTEGER NOT NULL DEFAULT 0,
+                  updated_at INTEGER NOT NULL,
+                  PRIMARY KEY(normalized_name, variant_text)
+                )
+                """
+            )
+            self.execute("CREATE INDEX IF NOT EXISTS idx_known_authors_frequency ON known_authors(frequency)")
+            self.execute("CREATE INDEX IF NOT EXISTS idx_author_variants_norm ON author_variants(normalized_name)")
+            version = 3
 
         self.set_state("schema_version", str(max(version, SCHEMA_VERSION)))
 

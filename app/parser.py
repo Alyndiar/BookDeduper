@@ -2,9 +2,13 @@ from __future__ import annotations
 import os
 import re
 import unicodedata
+import logging
 from dataclasses import dataclass
-from typing import Optional, Tuple, List
+from difflib import SequenceMatcher
+from typing import Optional, Tuple, List, Dict, Any
 from .util import normalize_text
+
+logger = logging.getLogger(__name__)
 
 TAG_RE = re.compile(r"\(([^)]+)\)$")
 BRACKET_TAG_RE = re.compile(r"\[([^\]]+)\]$")
@@ -21,6 +25,13 @@ STRICT_RE = re.compile(
     re.VERBOSE
 )
 
+STOPWORDS = {
+    "volume", "vol", "book", "series", "edition", "part", "tome", "integrale", "complete", "collection"
+}
+TITLE_LEAD_WORDS = {"the", "a", "an"}
+TAG_WORDS = {"retail", "ocr", "scan", "fixed", "v2", "v3", "v4", "v5"}
+DASH_SEPS = [" - ", " – ", " — "]
+
 _SUFFIX_CANON = {
     "jr": "Jr",
     "sr": "Sr",
@@ -29,6 +40,41 @@ _SUFFIX_CANON = {
     "aine": "Aîné",
     "ainee": "Aînée",
 }
+
+
+@dataclass
+class AuthorCandidate:
+    display: str
+    normalized: str
+    score: float
+    reason: str
+
+
+@dataclass
+class MergeSuggestion:
+    left_name: str
+    right_name: str
+    similarity: float
+    reason: str
+    auto_merge_safe: bool
+
+
+@dataclass
+class Parsed:
+    author: str
+    series: Optional[str]
+    series_index: Optional[float]
+    title: str
+    tags: List[str]
+
+    author_norm: str
+    series_norm: str
+    title_norm: str
+    work_key: str
+
+    author_confidence: float = 0.0
+    author_reason: str = ""
+    author_trace: str = ""
 
 
 def _strip_accents(s: str) -> str:
@@ -81,6 +127,112 @@ def normalize_author_display(author: str) -> str:
     return " & ".join(normalized) if normalized else "Unknown"
 
 
+def _is_name_like(text: str) -> Tuple[bool, float, List[str]]:
+    cleaned = text.strip()
+    if not cleaned:
+        return False, 0.0, ["empty"]
+
+    norm = normalize_text(cleaned)
+    tokens = [t for t in norm.split() if t]
+    reasons: List[str] = []
+    if not (1 <= len(tokens) <= 5):
+        reasons.append("token_count")
+    score = 0.5
+
+    if any(t in STOPWORDS for t in tokens):
+        score -= 0.25
+        reasons.append("stopword_penalty")
+    if any(t in TAG_WORDS for t in tokens):
+        score -= 0.25
+        reasons.append("tag_penalty")
+    if tokens and tokens[0] in TITLE_LEAD_WORDS:
+        score -= 0.12
+        reasons.append("title_lead_penalty")
+
+    digit_chars = sum(ch.isdigit() for ch in cleaned)
+    if digit_chars >= max(3, len(cleaned) // 4):
+        score -= 0.3
+        reasons.append("digit_heavy")
+
+    if re.search(r"\b97[89]\d{10}\b", _strip_accents(cleaned).replace("-", "")):
+        score -= 0.4
+        reasons.append("isbn_like")
+
+    if re.search(r"\b([A-Za-z]\.){1,4}\b", cleaned):
+        score += 0.08
+        reasons.append("initials_pattern")
+
+    if "," in cleaned:
+        score += 0.05
+        reasons.append("comma_order")
+
+    for t in tokens:
+        if len(t) > 1 and t[0].isalpha():
+            score += 0.02
+
+    valid = score >= 0.25 and len(tokens) > 0
+    return valid, max(0.0, min(score, 1.0)), reasons
+
+
+def _add_candidate(out: List[AuthorCandidate], raw_author: str, base_score: float, reason: str):
+    display = normalize_author_display(raw_author)
+    normalized = normalize_text(display)
+    if not normalized or normalized == "unknown":
+        return
+    valid, name_score, penalties = _is_name_like(raw_author)
+    score = max(0.0, min(1.0, base_score + (name_score - 0.5) * 0.4))
+    if not valid:
+        score *= 0.5
+    full_reason = f"{reason};heur={','.join(penalties) if penalties else 'ok'}"
+    out.append(AuthorCandidate(display=display, normalized=normalized, score=score, reason=full_reason))
+
+
+def extract_author_candidates(stem: str, known_authors: Optional[Dict[str, Dict[str, Any]]] = None) -> List[AuthorCandidate]:
+    known_authors = known_authors or {}
+    candidates: List[AuthorCandidate] = []
+    s = stem.strip()
+
+    m = re.match(r"^\s*[\[(](.+?)[\])]\s+", s)
+    if m:
+        _add_candidate(candidates, m.group(1), 0.95, "bracketed_prefix")
+
+    for sep in DASH_SEPS:
+        if sep in s:
+            left, right = s.split(sep, 1)
+            _add_candidate(candidates, left.strip(), 0.84, "prefix_split")
+            if "," in left:
+                _add_candidate(candidates, left.strip(), 0.96, "prefix_comma_order")
+            _add_candidate(candidates, right.strip(), 0.84, "suffix_split")
+            break
+
+    for sep in DASH_SEPS:
+        if sep in s:
+            left, right = s.rsplit(sep, 1)
+            _add_candidate(candidates, right.strip(), 0.88, "suffix_split_last")
+            break
+
+    if len(candidates) == 0:
+        for part in re.split(r"[\-–—]", s):
+            part = part.strip()
+            if part:
+                _add_candidate(candidates, part, 0.45, "infix_scan")
+
+    boosted: List[AuthorCandidate] = []
+    for c in candidates:
+        freq = 0
+        if c.normalized in known_authors:
+            freq = int(known_authors[c.normalized].get("frequency", 0))
+        boost = 0.0
+        if freq > 0:
+            boost = min(0.22, 0.05 + (freq / 200.0))
+        score = max(0.0, min(1.0, c.score + boost))
+        reason = c.reason + (f";known_boost={boost:.2f}" if boost > 0 else "")
+        boosted.append(AuthorCandidate(display=c.display, normalized=c.normalized, score=score, reason=reason))
+
+    boosted.sort(key=lambda c: (c.score, known_authors.get(c.normalized, {}).get("frequency", 0), c.display), reverse=True)
+    return boosted
+
+
 def strip_trailing_tags(stem: str) -> Tuple[str, List[str]]:
     tags: List[str] = []
     s = stem.strip()
@@ -99,25 +251,11 @@ def strip_trailing_tags(stem: str) -> Tuple[str, List[str]]:
     return s, tags
 
 
-@dataclass
-class Parsed:
-    author: str
-    series: Optional[str]
-    series_index: Optional[float]
-    title: str
-    tags: List[str]
-
-    author_norm: str
-    series_norm: str
-    title_norm: str
-    work_key: str
-
-
 def make_work_key(author_norm: str, series_norm: str, title_norm: str, series_index_norm: str) -> str:
     return f"{author_norm}||{series_norm}||{series_index_norm}||{title_norm}"
 
 
-def parse_filename(name: str) -> Parsed:
+def parse_filename(name: str, known_authors: Optional[Dict[str, Dict[str, Any]]] = None) -> Parsed:
     base = os.path.basename(name)
     stem = base
     if "." in stem:
@@ -129,6 +267,7 @@ def parse_filename(name: str) -> Parsed:
     series = None
     series_index = None
     title = stem.strip()
+    trace: List[str] = []
 
     m = STRICT_RE.match(stem)
     if m:
@@ -141,6 +280,7 @@ def parse_filename(name: str) -> Parsed:
                 series_index = float(m.group("series_index"))
             except Exception:
                 series_index = None
+        trace.append("strict_pattern_match")
     else:
         parts = [p.strip() for p in stem.split(" - ") if p.strip()]
         if len(parts) >= 2:
@@ -162,6 +302,21 @@ def parse_filename(name: str) -> Parsed:
                         series_index = float(sm2.group(2))
                     except Exception:
                         series_index = None
+        trace.append("legacy_fallback")
+
+    candidates = extract_author_candidates(stem, known_authors=known_authors)
+    chosen_conf = 0.35
+    chosen_reason = "fallback_unknown"
+    if candidates:
+        top = candidates[0]
+        known_hit = bool(known_authors and top.normalized in known_authors)
+        if top.reason.startswith("infix_scan") and not known_hit and top.score < 0.93:
+            trace.append("infix_rejected_low_confidence")
+        else:
+            author = top.display
+            chosen_conf = top.score
+            chosen_reason = top.reason
+        trace.extend([f"candidate:{c.display}:{c.score:.2f}:{c.reason}" for c in candidates[:6]])
 
     author = normalize_author_display(author)
     author_norm = normalize_text(author)
@@ -176,6 +331,9 @@ def parse_filename(name: str) -> Parsed:
 
     work_key = make_work_key(author_norm, series_norm, title_norm, series_index_norm)
 
+    trace_text = " | ".join(trace)
+    logger.debug("parse_filename name=%s author=%s conf=%.2f reason=%s trace=%s", name, author, chosen_conf, chosen_reason, trace_text)
+
     return Parsed(
         author=author,
         series=series,
@@ -186,8 +344,54 @@ def parse_filename(name: str) -> Parsed:
         series_norm=series_norm,
         title_norm=title_norm,
         work_key=work_key,
+        author_confidence=chosen_conf,
+        author_reason=chosen_reason,
+        author_trace=trace_text,
     )
 
 
 def detect_quality_tags(tags: List[str]) -> List[str]:
     return [t.strip().lower() for t in tags if t.strip()]
+
+
+def _token_jaccard(a: str, b: str) -> float:
+    sa = set(a.split())
+    sb = set(b.split())
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / len(sa | sb)
+
+
+def _punctuation_only_variant(a: str, b: str) -> bool:
+    pa = re.sub(r"[\W_]+", "", a.lower())
+    pb = re.sub(r"[\W_]+", "", b.lower())
+    return pa == pb
+
+
+def build_merge_suggestions(
+    known_authors: List[Tuple[str, str, int]],
+    threshold: float = 0.92,
+) -> List[MergeSuggestion]:
+    suggestions: List[MergeSuggestion] = []
+    for i in range(len(known_authors)):
+        ln, ld, _lf = known_authors[i]
+        for j in range(i + 1, len(known_authors)):
+            rn, rd, _rf = known_authors[j]
+            jacc = _token_jaccard(ln, rn)
+            seq = SequenceMatcher(None, ln, rn).ratio()
+            sim = 0.62 * jacc + 0.38 * seq
+            reason = "token+string similarity"
+            if sorted(ln.split()) == sorted(rn.split()):
+                sim = max(sim, 0.97)
+                reason = "comma-order variant"
+            elif "," in ld or "," in rd:
+                reason = "comma-order variant"
+            elif _punctuation_only_variant(ld, rd):
+                reason = "punctuation-only difference"
+            if sim < threshold:
+                continue
+            auto_merge_safe = sim >= 0.98 and _punctuation_only_variant(ld, rd)
+            suggestions.append(MergeSuggestion(ld, rd, sim, reason, auto_merge_safe))
+    suggestions.sort(key=lambda s: (s.similarity, s.left_name, s.right_name), reverse=True)
+    logger.debug("merge_suggestions count=%s", len(suggestions))
+    return suggestions

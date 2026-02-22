@@ -1,13 +1,16 @@
 from __future__ import annotations
 import os
 import time
+import logging
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Tuple
 from PySide6.QtCore import QObject, Signal
 from .db import DB
 from .util import norm_path, file_sig_from_stat, ext_of, is_probably_archive, dumps, loads, now_ts, normalize_text
-from .parser import parse_filename, detect_quality_tags, make_work_key
+from .parser import parse_filename, detect_quality_tags, make_work_key, build_merge_suggestions
 from .sevenzip import detect_7z, list_archive_exts
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class ScanConfig:
@@ -233,6 +236,56 @@ class ScanWorker(QObject):
                 (alias_norm, parsed.author_norm, parsed.author, 1.0, "derived", ts),
             )
 
+
+    def _load_known_authors(self) -> Dict[str, Dict[str, object]]:
+        try:
+            rows = self.db.query_all("SELECT normalized_name, canonical_name, frequency FROM known_authors")
+        except Exception:
+            return {}
+        out: Dict[str, Dict[str, object]] = {}
+        for r in rows:
+            n = str(r["normalized_name"] or "").strip()
+            if not n:
+                continue
+            out[n] = {
+                "canonical": str(r["canonical_name"] or "").strip() or n,
+                "frequency": int(r["frequency"] or 0),
+            }
+        return out
+
+    def _upsert_known_author(self, parsed, known_authors: Dict[str, Dict[str, object]], ts: int):
+        if (parsed.author_confidence or 0.0) < 0.70:
+            return
+        if not parsed.author_norm or parsed.author_norm == "unknown":
+            return
+        self.db.execute(
+            """
+            INSERT INTO known_authors(normalized_name,canonical_name,frequency,created_at,updated_at)
+            VALUES(?,?,?,?,?)
+            ON CONFLICT(normalized_name) DO UPDATE SET
+              canonical_name=excluded.canonical_name,
+              frequency=known_authors.frequency+1,
+              updated_at=excluded.updated_at
+            """,
+            (parsed.author_norm, parsed.author, 1, ts, ts),
+        )
+        self.db.execute(
+            """
+            INSERT INTO author_variants(normalized_name,variant_text,frequency,updated_at)
+            VALUES(?,?,?,?)
+            ON CONFLICT(normalized_name,variant_text) DO UPDATE SET
+              frequency=author_variants.frequency+1,
+              updated_at=excluded.updated_at
+            """,
+            (parsed.author_norm, parsed.author, 1, ts),
+        )
+        cur = known_authors.get(parsed.author_norm, {"canonical": parsed.author, "frequency": 0})
+        known_authors[parsed.author_norm] = {
+            "canonical": parsed.author,
+            "frequency": int(cur.get("frequency", 0)) + 1,
+        }
+        logger.debug("known_author_upsert author=%s conf=%.2f", parsed.author, parsed.author_confidence)
+
     def _run_scan(self) -> Tuple[bool, str]:
         roots_rows = self.db.query_all("SELECT id,path FROM roots WHERE enabled=1 ORDER BY id")
         roots = [r["path"] for r in roots_rows]
@@ -242,6 +295,7 @@ class ScanWorker(QObject):
         scan_id = self._start_scan_run()
         self._ensure_7z()
         author_aliases = self._load_author_aliases()
+        known_authors = self._load_known_authors()
 
         stack = self._load_stack(roots)
         stats = {
@@ -331,9 +385,12 @@ class ScanWorker(QObject):
 
                             stats["files_changed"] += 1
 
-                            parsed = parse_filename(name)
+                            parsed = parse_filename(name, known_authors=known_authors)
                             self._try_correct_author(parsed, name, author_aliases)
-                            self._learn_author_alias(parsed, author_aliases, now_ts())
+                            ts_now = now_ts()
+                            self._learn_author_alias(parsed, author_aliases, ts_now)
+                            self._upsert_known_author(parsed, known_authors, ts_now)
+                            logger.debug("author_decision path=%s author=%s conf=%.2f reason=%s trace=%s", p, parsed.author, parsed.author_confidence, parsed.author_reason, parsed.author_trace)
                             tags_lower = detect_quality_tags(parsed.tags)
 
                             inner_guess = None
@@ -445,6 +502,12 @@ class ScanWorker(QObject):
                     continue
 
             self.db.commit()
+            try:
+                rows = self.db.query_all("SELECT normalized_name, canonical_name, frequency FROM known_authors")
+                suggestions = build_merge_suggestions([(r["normalized_name"], r["canonical_name"], int(r["frequency"] or 0)) for r in rows])
+                logger.debug("author_merge_suggestions_generated count=%s", len(suggestions))
+            except Exception:
+                pass
 
         except Exception:
             self.db.rollback()
