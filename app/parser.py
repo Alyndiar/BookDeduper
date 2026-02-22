@@ -187,8 +187,9 @@ def _add_candidate(out: List[AuthorCandidate], raw_author: str, base_score: floa
     out.append(AuthorCandidate(display=display, normalized=normalized, score=score, reason=full_reason))
 
 
-def extract_author_candidates(stem: str, known_authors: Optional[Dict[str, Dict[str, Any]]] = None) -> List[AuthorCandidate]:
+def extract_author_candidates(stem: str, known_authors: Optional[Dict[str, Dict[str, Any]]] = None, invalid_authors: Optional[set[str]] = None) -> List[AuthorCandidate]:
     known_authors = known_authors or {}
+    invalid_authors = invalid_authors or set()
     candidates: List[AuthorCandidate] = []
     s = stem.strip()
 
@@ -219,6 +220,8 @@ def extract_author_candidates(stem: str, known_authors: Optional[Dict[str, Dict[
 
     boosted: List[AuthorCandidate] = []
     for c in candidates:
+        if c.normalized in invalid_authors:
+            continue
         freq = 0
         if c.normalized in known_authors:
             freq = int(known_authors[c.normalized].get("frequency", 0))
@@ -255,7 +258,7 @@ def make_work_key(author_norm: str, series_norm: str, title_norm: str, series_in
     return f"{author_norm}||{series_norm}||{series_index_norm}||{title_norm}"
 
 
-def parse_filename(name: str, known_authors: Optional[Dict[str, Dict[str, Any]]] = None) -> Parsed:
+def parse_filename(name: str, known_authors: Optional[Dict[str, Dict[str, Any]]] = None, invalid_authors: Optional[set[str]] = None) -> Parsed:
     base = os.path.basename(name)
     stem = base
     if "." in stem:
@@ -304,7 +307,7 @@ def parse_filename(name: str, known_authors: Optional[Dict[str, Dict[str, Any]]]
                         series_index = None
         trace.append("legacy_fallback")
 
-    candidates = extract_author_candidates(stem, known_authors=known_authors)
+    candidates = extract_author_candidates(stem, known_authors=known_authors, invalid_authors=invalid_authors)
     chosen_conf = 0.35
     chosen_reason = "fallback_unknown"
     if candidates:

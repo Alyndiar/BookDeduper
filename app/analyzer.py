@@ -1,11 +1,15 @@
 from __future__ import annotations
 import time
+import logging
+from collections import defaultdict
 from typing import Dict, List, Tuple
 from PySide6.QtCore import QObject, Signal
 from .db import DB
 from .util import now_ts
-from .parser import detect_quality_tags
+from .parser import detect_quality_tags, parse_filename, build_merge_suggestions
 from .ranker import pick_best
+
+logger = logging.getLogger(__name__)
 
 class AnalyzeWorker(QObject):
     progress = Signal(str)
@@ -39,6 +43,46 @@ class AnalyzeWorker(QObject):
         except Exception as e:
             self.finished.emit(False, f"Analyze error: {e!r}")
 
+    def _load_invalid_set(self) -> set[str]:
+        rows = self.db.query_all("SELECT normalized_name FROM invalid_authors")
+        return {str(r["normalized_name"] or "").strip() for r in rows if str(r["normalized_name"] or "").strip()}
+
+    def _rebuild_known_authors(self):
+        invalid_set = self._load_invalid_set()
+        files = self.db.query_all("SELECT id,name FROM files")
+        temp_counts: Dict[str, Dict[str, object]] = {}
+
+        for r in files:
+            parsed = parse_filename(str(r["name"] or ""), invalid_authors=invalid_set)
+            if parsed.author_confidence < 0.70:
+                continue
+            if not parsed.author_norm or parsed.author_norm in invalid_set or parsed.author_norm == "unknown":
+                continue
+            row = temp_counts.get(parsed.author_norm)
+            if not row:
+                temp_counts[parsed.author_norm] = {"canonical": parsed.author, "frequency": 1}
+            else:
+                row["frequency"] = int(row["frequency"]) + 1
+                if len(parsed.author) > len(str(row["canonical"])):
+                    row["canonical"] = parsed.author
+
+        ts = now_ts()
+        self.db.execute("DELETE FROM known_authors")
+        self.db.execute("DELETE FROM author_variants")
+        for norm, info in temp_counts.items():
+            self.db.execute(
+                "INSERT INTO known_authors(normalized_name,canonical_name,frequency,created_at,updated_at) VALUES(?,?,?,?,?)",
+                (norm, str(info["canonical"]), int(info["frequency"]), ts, ts),
+            )
+            self.db.execute(
+                "INSERT INTO author_variants(normalized_name,variant_text,frequency,updated_at) VALUES(?,?,?,?)",
+                (norm, str(info["canonical"]), int(info["frequency"]), ts),
+            )
+
+        known_for_suggest = [(k, str(v["canonical"]), int(v["frequency"])) for k, v in temp_counts.items()]
+        suggestions = build_merge_suggestions(known_for_suggest)
+        logger.debug("author_db_rebuilt authors=%s suggestions=%s", len(temp_counts), len(suggestions))
+
     def _run_analyze(self) -> Tuple[bool, str]:
         if self.db.get_state("scan_completed", "0") != "1":
             return False, "Scan must complete before Analyze."
@@ -49,6 +93,14 @@ class AnalyzeWorker(QObject):
         last_key = self.db.get_state("analyze_last_work_key", "")
         stats = {"works": 0, "works_with_dupes": 0, "queued": 0}
         self.stats.emit(stats.copy())
+
+        self.db.begin()
+        try:
+            self._rebuild_known_authors()
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
 
         if last_key:
             works = self.db.query_all("SELECT work_key FROM works WHERE work_key > ? ORDER BY work_key", (last_key,))
