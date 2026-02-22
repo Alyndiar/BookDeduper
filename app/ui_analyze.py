@@ -8,6 +8,7 @@ class AnalyzeTab(QWidget):
         super().__init__()
         self.get_db = get_db
         self.on_analyze_completed = on_analyze_completed
+        self.current_phase = "duplicates"
 
         lay = QVBoxLayout(self)
         self.status = QLabel("Analyze status: idle")
@@ -18,9 +19,13 @@ class AnalyzeTab(QWidget):
         lay.addWidget(self.log, 1)
 
         row = QHBoxLayout()
-        self.btn_start = QPushButton("Start / Resume Analyze")
-        self.btn_start.clicked.connect(self.start)
-        row.addWidget(self.btn_start)
+        self.btn_authors = QPushButton("Analyze Authors")
+        self.btn_authors.clicked.connect(lambda: self.start("authors"))
+        row.addWidget(self.btn_authors)
+
+        self.btn_duplicates = QPushButton("Analyze Duplicates")
+        self.btn_duplicates.clicked.connect(lambda: self.start("duplicates"))
+        row.addWidget(self.btn_duplicates)
 
         self.btn_pause = QPushButton("Pause")
         self.btn_pause.clicked.connect(self.pause)
@@ -48,14 +53,17 @@ class AnalyzeTab(QWidget):
             self.status.setText("Analyze status: (no project)")
             return
         scan_done = (db.get_state("scan_completed", "0") == "1")
-        self.btn_start.setEnabled(scan_done and self.thread is None)
+        self.btn_authors.setEnabled(scan_done and self.thread is None)
+        self.btn_duplicates.setEnabled(scan_done and self.thread is None)
         last = db.get_state("analyze_last_work_key", "")
-        self.status.setText(f"Analyze status: ready (resume_key={last[:60]})")
+        ad = db.get_state("analyze_authors_completed", "0")
+        dd = db.get_state("analyze_duplicates_completed", db.get_state("analyze_completed", "0"))
+        self.status.setText(f"Analyze: authors_done={ad} duplicates_done={dd} resume_key={last[:40]}")
 
     def append(self, s: str):
         self.log.append(s)
 
-    def start(self):
+    def start(self, phase: str):
         db = self.get_db()
         if not db:
             QMessageBox.information(self, "Analyze", "Open a project first.")
@@ -67,8 +75,9 @@ class AnalyzeTab(QWidget):
             QMessageBox.information(self, "Analyze", "Analyze already running.")
             return
 
+        self.current_phase = phase
         self.thread = QThread()
-        self.worker = AnalyzeWorker(db)
+        self.worker = AnalyzeWorker(db, phase=phase)
         self.worker.moveToThread(self.thread)
 
         self.thread.started.connect(self.worker.run)
@@ -76,12 +85,13 @@ class AnalyzeTab(QWidget):
         self.worker.stats.connect(self.on_stats)
         self.worker.finished.connect(self.on_finished)
 
-        self.btn_start.setEnabled(False)
+        self.btn_authors.setEnabled(False)
+        self.btn_duplicates.setEnabled(False)
         self.btn_pause.setEnabled(True)
         self.btn_stop.setEnabled(True)
         self.btn_resume.setEnabled(False)
 
-        self.append("=== Analyze started/resumed ===")
+        self.append(f"=== {phase} started ===")
         self.thread.start()
 
     def pause(self):
@@ -122,7 +132,8 @@ class AnalyzeTab(QWidget):
         self.thread = None
         self.worker = None
 
-        self.btn_start.setEnabled(True)
+        self.btn_authors.setEnabled(True)
+        self.btn_duplicates.setEnabled(True)
         self.btn_pause.setEnabled(False)
         self.btn_resume.setEnabled(False)
         self.btn_stop.setEnabled(False)

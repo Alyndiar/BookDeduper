@@ -54,13 +54,14 @@ class MainWindow(QMainWindow):
         self.roots_tab.refresh()
 
         scan_done = (self.db.get_state("scan_completed", "0") == "1")
-        analyze_done = (self.db.get_state("analyze_completed", "0") == "1")
+        analyze_done = (self.db.get_state("analyze_duplicates_completed", self.db.get_state("analyze_completed", "0")) == "1")
+        authors_done = (self.db.get_state("analyze_authors_completed", "0") == "1")
 
         self.tabs.setTabEnabled(2, True)
         self.tabs.setTabEnabled(3, scan_done)
         self.tabs.setTabEnabled(4, analyze_done)
         has_author_db = bool(self.db.query_one("SELECT 1 FROM known_authors LIMIT 1") or self.db.query_one("SELECT 1 FROM invalid_authors LIMIT 1"))
-        self.tabs.setTabEnabled(5, analyze_done and has_author_db)
+        self.tabs.setTabEnabled(5, (authors_done or analyze_done) and has_author_db)
 
         self.scan_tab.refresh()
         self.analyze_tab.refresh()

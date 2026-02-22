@@ -1,7 +1,7 @@
 from __future__ import annotations
 import time
 import logging
-from collections import defaultdict
+import os
 from typing import Dict, List, Tuple
 from PySide6.QtCore import QObject, Signal
 from .db import DB
@@ -11,14 +11,16 @@ from .ranker import pick_best
 
 logger = logging.getLogger(__name__)
 
+
 class AnalyzeWorker(QObject):
     progress = Signal(str)
     stats = Signal(dict)
     finished = Signal(bool, str)
 
-    def __init__(self, db: DB, commit_every: int = 2000):
+    def __init__(self, db: DB, phase: str = "duplicates", commit_every: int = 2000):
         super().__init__()
         self.db = db
+        self.phase = phase
         self.commit_every = commit_every
         self._pause = False
         self._stop = False
@@ -38,7 +40,10 @@ class AnalyzeWorker(QObject):
 
     def run(self):
         try:
-            ok, msg = self._run_analyze()
+            if self.phase == "authors":
+                ok, msg = self._run_analyze_authors()
+            else:
+                ok, msg = self._run_analyze_duplicates()
             self.finished.emit(ok, msg)
         except Exception as e:
             self.finished.emit(False, f"Analyze error: {e!r}")
@@ -52,7 +57,12 @@ class AnalyzeWorker(QObject):
         files = self.db.query_all("SELECT id,name FROM files")
         temp_counts: Dict[str, Dict[str, object]] = {}
 
-        for r in files:
+        for i, r in enumerate(files, start=1):
+            if self._stop:
+                break
+            self._maybe_pause()
+            if i % 500 == 0:
+                self.progress.emit(f"Analyze Authors: {i}/{len(files)}")
             parsed = parse_filename(str(r["name"] or ""), invalid_authors=invalid_set)
             if parsed.author_confidence < 0.70:
                 continue
@@ -83,24 +93,32 @@ class AnalyzeWorker(QObject):
         suggestions = build_merge_suggestions(known_for_suggest)
         logger.debug("author_db_rebuilt authors=%s suggestions=%s", len(temp_counts), len(suggestions))
 
-    def _run_analyze(self) -> Tuple[bool, str]:
+    def _run_analyze_authors(self) -> Tuple[bool, str]:
         if self.db.get_state("scan_completed", "0") != "1":
-            return False, "Scan must complete before Analyze."
+            return False, "Scan must complete before Analyze Authors."
+        self.db.begin()
+        try:
+            self._rebuild_known_authors()
+            self.db.set_state("analyze_authors_completed", "1")
+            self.db.set_state("author_db_dirty", "0")
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
+        if self._stop:
+            return False, "Analyze Authors aborted."
+        return True, "Analyze Authors completed."
 
-        self.db.set_state("last_action", "analyze")
+    def _run_analyze_duplicates(self) -> Tuple[bool, str]:
+        if self.db.get_state("scan_completed", "0") != "1":
+            return False, "Scan must complete before Analyze Duplicates."
+
+        self.db.set_state("last_action", "analyze_duplicates")
         self.db.execute("DELETE FROM deletion_queue")
 
         last_key = self.db.get_state("analyze_last_work_key", "")
         stats = {"works": 0, "works_with_dupes": 0, "queued": 0}
         self.stats.emit(stats.copy())
-
-        self.db.begin()
-        try:
-            self._rebuild_known_authors()
-            self.db.commit()
-        except Exception:
-            self.db.rollback()
-            raise
 
         if last_key:
             works = self.db.query_all("SELECT work_key FROM works WHERE work_key > ? ORDER BY work_key", (last_key,))
@@ -119,7 +137,7 @@ class AnalyzeWorker(QObject):
                 stats["works"] += 1
 
                 if stats["works"] % 200 == 0:
-                    self.progress.emit(f"Analyzing work {stats['works']}: {work_key[:60]}")
+                    self.progress.emit(f"Analyzing duplicates {stats['works']}: {work_key[:60]}")
                     self.stats.emit(stats.copy())
 
                 rows = self.db.query_all(
@@ -176,6 +194,7 @@ class AnalyzeWorker(QObject):
             raise
 
         if self._stop:
-            return False, "Analyze aborted."
+            return False, "Analyze Duplicates aborted."
         self.db.set_state("analyze_completed", "1")
-        return True, "Analyze completed."
+        self.db.set_state("analyze_duplicates_completed", "1")
+        return True, "Analyze Duplicates completed."
