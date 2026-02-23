@@ -72,7 +72,6 @@ class MainWindow(QMainWindow):
 
         self._set_field_texts("Idle", 0, 0, 0, 0, 0, 0, 0)
 
-        sep_w = fm.horizontalAdvance("|") + 4
         self._status_required_width = (
             self.status_label.width()
             + self.dirs_label.width()
@@ -80,22 +79,15 @@ class MainWindow(QMainWindow):
             + self.authors_label.width()
             + self.groups_files_label.width()
             + self.left_label.width()
-            + (6 * sep_w)
             + 60
         )
 
         self.status.addWidget(self.status_label)
-        self.status.addWidget(self._make_sep(mono))
         self.status.addWidget(self.dirs_label)
-        self.status.addWidget(self._make_sep(mono))
         self.status.addWidget(self.files_label)
-        self.status.addWidget(self._make_sep(mono))
         self.status.addWidget(self.authors_label)
-        self.status.addWidget(self._make_sep(mono))
         self.status.addWidget(self.groups_files_label)
-        self.status.addWidget(self._make_sep(mono))
-        self.status.addWidget(self.left_label)
-        self.status.addWidget(self._make_sep(mono), 1)
+        self.status.addWidget(self.left_label, 1)
 
         self.read_box = self._make_io_box("R", mono)
         self.write_box = self._make_io_box("W", mono)
@@ -111,10 +103,6 @@ class MainWindow(QMainWindow):
         label.setFixedWidth(fm.horizontalAdvance(template) + 10)
         return label
 
-    def _make_sep(self, font) -> QLabel:
-        lbl = QLabel("|")
-        lbl.setFont(font)
-        return lbl
 
     def _make_io_box(self, label: str, font) -> QLabel:
         box = QLabel(label)
