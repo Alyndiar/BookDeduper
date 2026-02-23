@@ -219,9 +219,11 @@ class DB:
         self.execute(f"PRAGMA synchronous={cfg['synchronous']};")
         self.execute("PRAGMA temp_store=MEMORY;")
         self.execute("PRAGMA cache_spill=OFF;")
-        self.execute("PRAGMA cache_size=?;", (int(cfg["cache_size"]),))
-        self.execute("PRAGMA mmap_size=?;", (int(cfg["mmap_size"]),))
-        self.execute("PRAGMA wal_autocheckpoint=?;", (int(cfg["wal_autocheckpoint"]),))
+        # SQLite PRAGMA statements do not support parameter placeholders here.
+        # Use validated integer values from MEMORY_PROFILES to avoid syntax errors.
+        self.execute(f"PRAGMA cache_size={int(cfg['cache_size'])};")
+        self.execute(f"PRAGMA mmap_size={int(cfg['mmap_size'])};")
+        self.execute(f"PRAGMA wal_autocheckpoint={int(cfg['wal_autocheckpoint'])};")
         self.set_state("memory_profile", profile)
 
     def memory_profile(self) -> str:
