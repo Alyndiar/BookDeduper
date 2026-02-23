@@ -4,7 +4,7 @@ import os
 import time
 from typing import Callable, Iterable, Optional
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 MEMORY_PROFILES = {
     "safe": {
@@ -235,6 +235,29 @@ class DB:
             )
             self.execute("CREATE INDEX IF NOT EXISTS idx_invalid_authors_name ON invalid_authors(canonical_name)")
             version = 4
+
+        if version < 5:
+            
+            try:
+                self.execute("ALTER TABLE known_authors ADD COLUMN preferred_name TEXT")
+            except Exception:
+                pass
+            self.execute("UPDATE known_authors SET preferred_name=canonical_name WHERE preferred_name IS NULL OR preferred_name='' ")
+            self.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tentative_authors(
+                  normalized_name TEXT PRIMARY KEY,
+                  canonical_name TEXT NOT NULL,
+                  preferred_name TEXT,
+                  frequency INTEGER NOT NULL DEFAULT 0,
+                  confidence REAL NOT NULL DEFAULT 0.0,
+                  created_at INTEGER NOT NULL,
+                  updated_at INTEGER NOT NULL
+                )
+                """
+            )
+            self.execute("CREATE INDEX IF NOT EXISTS idx_tentative_authors_frequency ON tentative_authors(frequency)")
+            version = 5
 
         self.set_state("schema_version", str(max(version, SCHEMA_VERSION)))
 

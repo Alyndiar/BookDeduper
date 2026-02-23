@@ -7,6 +7,7 @@ from PySide6.QtCore import QObject, Signal
 from .db import DB
 from .util import now_ts
 from .parser import detect_quality_tags, parse_filename, build_merge_suggestions
+from .util import normalize_text
 from .ranker import pick_best
 
 logger = logging.getLogger(__name__)
@@ -78,17 +79,23 @@ class AnalyzeWorker(QObject):
         for norm, info in known_delta.items():
             known_rows.append((norm, str(info["canonical"]), int(info["frequency"]), ts, ts))
         if known_rows:
+            tentative_rows = []
+            for norm, info in known_delta.items():
+                tentative_rows.append((norm, str(info["canonical"]), str(info["canonical"]), int(info["frequency"]), float(info.get("confidence", 0.0)), ts, ts))
             self.db.executemany(
                 """
-                INSERT INTO known_authors(normalized_name,canonical_name,frequency,created_at,updated_at)
-                VALUES(?,?,?,?,?)
+                INSERT INTO tentative_authors(normalized_name,canonical_name,preferred_name,frequency,confidence,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?)
                 ON CONFLICT(normalized_name) DO UPDATE SET
-                  canonical_name=CASE WHEN length(excluded.canonical_name) > length(known_authors.canonical_name)
-                    THEN excluded.canonical_name ELSE known_authors.canonical_name END,
-                  frequency=known_authors.frequency + excluded.frequency,
+                  canonical_name=CASE WHEN length(excluded.canonical_name) > length(tentative_authors.canonical_name)
+                    THEN excluded.canonical_name ELSE tentative_authors.canonical_name END,
+                  preferred_name=CASE WHEN length(excluded.preferred_name) > length(coalesce(tentative_authors.preferred_name,''))
+                    THEN excluded.preferred_name ELSE coalesce(tentative_authors.preferred_name, tentative_authors.canonical_name) END,
+                  frequency=tentative_authors.frequency + excluded.frequency,
+                  confidence=MAX(tentative_authors.confidence, excluded.confidence),
                   updated_at=excluded.updated_at
                 """,
-                known_rows,
+                tentative_rows,
             )
 
         variant_rows = []
@@ -120,7 +127,7 @@ class AnalyzeWorker(QObject):
         if dirty:
             self.db.begin()
             try:
-                self.db.execute("DELETE FROM known_authors")
+                self.db.execute("DELETE FROM tentative_authors")
                 self.db.execute("DELETE FROM author_variants")
                 self.db.set_state("analyze_authors_last_file_id", "0")
                 self.db.set_state("analyze_authors_completed", "0")
@@ -151,15 +158,28 @@ class AnalyzeWorker(QObject):
                 fid = int(r["id"])
                 parsed = parse_filename(str(r["name"] or ""), invalid_authors=invalid_set)
                 if parsed.author_confidence >= 0.70 and parsed.author_norm and parsed.author_norm not in invalid_set and parsed.author_norm != "unknown":
-                    rec = known_delta.get(parsed.author_norm)
-                    if not rec:
-                        known_delta[parsed.author_norm] = {"canonical": parsed.author, "frequency": 1}
-                    else:
-                        rec["frequency"] = int(rec["frequency"]) + 1
-                        if len(parsed.author) > len(str(rec["canonical"])):
-                            rec["canonical"] = parsed.author
-                    k = (parsed.author_norm, parsed.author)
-                    variant_delta[k] = int(variant_delta.get(k, 0)) + 1
+                    author_parts = [a.strip() for a in str(parsed.author).split("&") if a.strip()]
+                    for part in author_parts:
+                        part_norm = normalize_text(part)
+                        if not part_norm or part_norm == "unknown" or part_norm in invalid_set:
+                            continue
+                        if len([t for t in part_norm.split() if t]) < 2:
+                            continue
+                        approved = self.db.query_one("SELECT 1 FROM known_authors WHERE normalized_name=?", (part_norm,))
+                        if approved:
+                            k = (part_norm, part)
+                            variant_delta[k] = int(variant_delta.get(k, 0)) + 1
+                            continue
+                        rec = known_delta.get(part_norm)
+                        if not rec:
+                            known_delta[part_norm] = {"canonical": part, "frequency": 1, "confidence": float(parsed.author_confidence)}
+                        else:
+                            rec["frequency"] = int(rec["frequency"]) + 1
+                            rec["confidence"] = max(float(rec.get("confidence", 0.0)), float(parsed.author_confidence))
+                            if len(part) > len(str(rec["canonical"])):
+                                rec["canonical"] = part
+                        k = (part_norm, part)
+                        variant_delta[k] = int(variant_delta.get(k, 0)) + 1
 
                 processed += 1
                 if processed % 500 == 0:
@@ -188,7 +208,7 @@ class AnalyzeWorker(QObject):
         # recompute suggestions from persisted known_authors only when completed.
         # This step is O(n²); emit percentage progress so long runs remain observable.
         if not self._stop:
-            rows = self.db.query_all("SELECT normalized_name, canonical_name, frequency FROM known_authors")
+            rows = self.db.query_all("SELECT normalized_name, COALESCE(preferred_name, canonical_name) AS canonical_name, frequency FROM known_authors UNION ALL SELECT normalized_name, COALESCE(preferred_name, canonical_name) AS canonical_name, frequency FROM tentative_authors")
             author_count = len(rows)
             self.progress.emit(f"Analyze Authors: finalizing merge suggestions for {author_count} authors…")
 
