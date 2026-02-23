@@ -133,6 +133,8 @@ class MainWindow(QMainWindow):
         return "Idle"
 
     def _on_tab_changed(self, _idx: int):
+        if not hasattr(self, "status_label"):
+            return
         self.refresh_all_statuses()
 
     def _on_io_signal(self, operation: str, active: bool):
