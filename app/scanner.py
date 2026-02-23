@@ -343,6 +343,11 @@ class ScanWorker(QObject):
                             self._learn_author_alias(parsed, author_aliases, ts_now)
                             tags_lower = detect_quality_tags(parsed.tags)
 
+                            # Remove file-format tags that duplicate the file's own extension for non-archives.
+                            if not is_arch:
+                                parsed.tags = [t for t in parsed.tags if t.strip().lower() != ext.lower()]
+                                tags_lower = detect_quality_tags(parsed.tags)
+
                             inner_guess = None
 
                             if is_arch:

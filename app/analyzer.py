@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 import time
 import logging
 from typing import Dict, List, Tuple
@@ -225,7 +226,7 @@ class AnalyzeWorker(QObject):
         if last_key:
             rows = self.db.query_all(
                 """
-                SELECT work_key,id,path,name,ext,is_archive,inner_ext_guess,size,mtime_ns,tags
+                SELECT work_key,id,path,name,ext,is_archive,inner_ext_guess,size,mtime_ns,tags,author_norm,title,series,series_index
                 FROM files
                 WHERE work_key > ?
                 ORDER BY work_key
@@ -235,7 +236,7 @@ class AnalyzeWorker(QObject):
         else:
             rows = self.db.query_all(
                 """
-                SELECT work_key,id,path,name,ext,is_archive,inner_ext_guess,size,mtime_ns,tags
+                SELECT work_key,id,path,name,ext,is_archive,inner_ext_guess,size,mtime_ns,tags,author_norm,title,series,series_index
                 FROM files
                 ORDER BY work_key
                 """
@@ -265,6 +266,56 @@ class AnalyzeWorker(QObject):
             "INSERT INTO deletion_queue(work_key,file_id,checked,reason,created_at) VALUES(?,?,?,?,?)",
             queue_rows,
         )
+
+    def _canonical_name_for_file(self, row: dict, parsed) -> str:
+        ext = str(row.get("ext") or "")
+        tags = [t.strip() for t in str(row.get("tags") or "").split("|") if t.strip()]
+        # Remove file-format tag when it matches the file itself. Keep format tag only for archives.
+        if int(row.get("is_archive") or 0) != 1:
+            tags = [t for t in tags if t.lower() != ext.lower()]
+
+        parts = [parsed.author]
+        if parsed.series and parsed.series_index is not None:
+            parts.append(f"[{parsed.series} {int(parsed.series_index) if float(parsed.series_index).is_integer() else parsed.series_index}]")
+        elif parsed.series:
+            parts.append(f"[{parsed.series}]")
+        parts.append(parsed.title)
+
+        base = " - ".join([p for p in parts if p])
+        if tags:
+            base = f"{base} ({' '.join(tags)})"
+        if ext:
+            base = f"{base}.{ext}"
+        return base
+
+    def _rename_single_if_needed(self, row: dict) -> Tuple[bool, bool, str]:
+        parsed = parse_filename(str(row.get("name") or ""))
+        if parsed.author_norm == "unknown":
+            return False, False, "unknown_author_discarded"
+
+        canonical = self._canonical_name_for_file(row, parsed)
+        old_name = str(row.get("name") or "")
+        if canonical == old_name:
+            return False, False, "canonical_name_ok"
+
+        if parsed.author_confidence < 0.90:
+            return False, True, f"rename_needs_confirmation_conf={parsed.author_confidence:.2f}"
+
+        src = str(row.get("path") or "")
+        if not src:
+            return False, False, "missing_path"
+        dst = os.path.join(os.path.dirname(src), canonical)
+        try:
+            if os.path.exists(src) and not os.path.exists(dst):
+                os.rename(src, dst)
+            folder = os.path.dirname(dst)
+            self.db.execute("UPDATE files SET path=?, name=?, folder_path=?, tags=? WHERE id=?", (dst, canonical, folder, " | ".join([t.strip() for t in str(row.get("tags") or "").split("|") if t.strip() and (int(row.get('is_archive') or 0) == 1 or t.strip().lower() != str(row.get('ext') or '').lower())]), int(row["id"])))
+            self.db.execute("UPDATE folders SET force_rescan=1 WHERE path=?", (folder,))
+            logger.info("auto_rename_single file_id=%s old=%s new=%s", int(row["id"]), old_name, canonical)
+            return True, False, "auto_renamed"
+        except Exception as e:
+            logger.warning("auto_rename_single_failed file_id=%s err=%r", int(row["id"]), e)
+            return False, True, "rename_failed_needs_confirmation"
 
     def _run_analyze_duplicates(self) -> Tuple[bool, str]:
         if self.db.get_state("scan_completed", "0") != "1":
@@ -313,24 +364,39 @@ class AnalyzeWorker(QObject):
                 stats["works"] += 1
 
                 if stats["works"] % 200 == 0:
-                    self.progress.emit(f"Analyzing duplicates {stats['works']}: {work_key[:60]}")
+                    self.progress.emit(f"Analyzing dupes {stats['works']}: {work_key[:60]}")
                     self.stats.emit(stats.copy())
 
                 if grouped_rows is not None:
                     rows = grouped_rows.get(work_key, [])
                 else:
                     rows = self.db.query_all(
-                        "SELECT id,path,name,ext,is_archive,inner_ext_guess,size,mtime_ns,tags FROM files WHERE work_key=?",
+                        "SELECT id,path,name,ext,is_archive,inner_ext_guess,size,mtime_ns,tags,author_norm,title,series,series_index FROM files WHERE work_key=?",
                         (work_key,),
                     )
-                if len(rows) <= 1:
+
+                rows_known = [r for r in rows if str(r["author_norm"] or "").strip().lower() != "unknown"]
+                if len(rows_known) <= 1:
+                    if len(rows_known) == 1:
+                        renamed, needs_review, reason = self._rename_single_if_needed(dict(rows_known[0]))
+                        if renamed:
+                            self.progress.emit(f"Auto-rename singleton: {rows_known[0]['name']} -> canonical")
+                        elif needs_review:
+                            created = now_ts()
+                            qrow = (work_key, int(rows_known[0]["id"]), 0, f"RENAME REVIEW ({reason})", created)
+                            if in_memory_queue is not None:
+                                in_memory_queue.append(qrow)
+                            else:
+                                self.db.execute("INSERT INTO deletion_queue(work_key,file_id,checked,reason,created_at) VALUES(?,?,?,?,?)", qrow)
+                            stats["queued"] += 1
+                            changed += 1
                     self.db.set_state("analyze_last_work_key", work_key)
                     continue
 
                 stats["works_with_dupes"] += 1
 
                 files: List[dict] = []
-                for r in rows:
+                for r in rows_known:
                     ext_eff = (r["inner_ext_guess"] if int(r["is_archive"] or 0) == 1 and r["inner_ext_guess"] else r["ext"]) or ""
                     tags_lower = detect_quality_tags((r["tags"] or "").split("|")) if (r["tags"] or "").strip() else []
                     files.append({
@@ -342,6 +408,10 @@ class AnalyzeWorker(QObject):
                         "mtime_ns": int(r["mtime_ns"]),
                         "size": int(r["size"]),
                     })
+
+                if len(files) <= 1:
+                    self.db.set_state("analyze_last_work_key", work_key)
+                    continue
 
                 best, keep_extra_ids = pick_best(files)
 
@@ -366,7 +436,6 @@ class AnalyzeWorker(QObject):
 
                 self.db.set_state("analyze_last_work_key", work_key)
 
-                # chunk-flush to reduce loss window while keeping low I/O
                 if in_memory_queue is not None and len(in_memory_queue) >= flush_chunk:
                     self._flush_duplicate_queue_chunk(in_memory_queue)
                     in_memory_queue.clear()

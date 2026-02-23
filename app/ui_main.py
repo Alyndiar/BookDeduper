@@ -64,11 +64,11 @@ class MainWindow(QMainWindow):
         fm = QFontMetrics(mono)
 
         self.status_label = self._make_field_label(mono, "Analyze Duplicates")
-        self.dirs_label = self._make_field_label(mono, "Dirs 9999999999")
-        self.files_label = self._make_field_label(mono, "Files 9999999999")
-        self.authors_label = self._make_field_label(mono, "Authors 9999999999")
-        self.groups_files_label = self._make_field_label(mono, "Groups/files 9999999999/9999999999")
-        self.left_label = self._make_field_label(mono, "Left 9999999999/9999999999")
+        self.dirs_label = self._make_field_label(mono, "Dirs 999999")
+        self.files_label = self._make_field_label(mono, "Files 9999999")
+        self.authors_label = self._make_field_label(mono, "Authors 9999999")
+        self.groups_files_label = self._make_field_label(mono, "Dupes 9999999/9999999")
+        self.left_label = self._make_field_label(mono, "Left 9999999/9999999")
 
         self._set_field_texts("Idle", 0, 0, 0, 0, 0, 0, 0)
 
@@ -192,7 +192,7 @@ class MainWindow(QMainWindow):
         self.dirs_label.setText(f"Dirs {dirs}")
         self.files_label.setText(f"Files {files}")
         self.authors_label.setText(f"Authors {authors}")
-        self.groups_files_label.setText(f"Groups/files {found_groups}/{found_files}")
+        self.groups_files_label.setText(f"Dupes {found_groups}/{found_files}")
         self.left_label.setText(f"Left {left_groups}/{left_files}")
 
     def refresh_all_statuses(self):

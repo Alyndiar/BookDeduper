@@ -82,7 +82,7 @@ class ReviewTab(QWidget):
             SELECT work_key, COUNT(*) AS cnt, SUM(checked) AS delcnt
             FROM deletion_queue
             GROUP BY work_key
-            HAVING cnt > 1
+            HAVING cnt > 1 OR SUM(CASE WHEN reason LIKE 'RENAME REVIEW%' THEN 1 ELSE 0 END) > 0
             ORDER BY delcnt DESC, cnt DESC
             LIMIT 5000
             """
