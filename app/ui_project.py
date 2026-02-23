@@ -52,6 +52,13 @@ class ProjectTab(QWidget):
         brow.addWidget(self.chk_backup_before_analyze)
         lay.addLayout(brow)
 
+        sbrow = QHBoxLayout()
+        self.chk_backup_before_scan = QCheckBox("Create DB backup before Scan phase")
+        self.chk_backup_before_scan.setChecked(False)
+        self.chk_backup_before_scan.stateChanged.connect(self.save_settings_if_open)
+        sbrow.addWidget(self.chk_backup_before_scan)
+        lay.addLayout(sbrow)
+
         mrow = QHBoxLayout()
         mrow.addWidget(QLabel("Memory profile:"))
         self.cmb_memory_profile = QComboBox()
@@ -112,6 +119,8 @@ class ProjectTab(QWidget):
 
         backup_before = (db.get_state("backup_before_analyze", "1") == "1")
         self.chk_backup_before_analyze.setChecked(backup_before)
+        backup_before_scan = (db.get_state("backup_before_scan", "0") == "1")
+        self.chk_backup_before_scan.setChecked(backup_before_scan)
 
         existing = db.get_state("7z_path", None)
         p = detect_7z(existing)
@@ -128,6 +137,7 @@ class ProjectTab(QWidget):
             return
         self._db.set_state("folder_skip_enabled", "1" if self.chk_folder_skip.isChecked() else "0")
         self._db.set_state("backup_before_analyze", "1" if self.chk_backup_before_analyze.isChecked() else "0")
+        self._db.set_state("backup_before_scan", "1" if self.chk_backup_before_scan.isChecked() else "0")
         self._db.apply_memory_profile(self.cmb_memory_profile.currentText())
 
     def redetect_7z(self):

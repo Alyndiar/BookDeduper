@@ -74,6 +74,13 @@ class ScanTab(QWidget):
             QMessageBox.information(self, "Scan", "Scan already running.")
             return
 
+        if db.get_state("backup_before_scan", "0") == "1":
+            try:
+                path = db.create_timestamped_backup(label="scan")
+                self.append(f"Backup created: {path}")
+            except Exception as e:
+                QMessageBox.warning(self, "Scan", f"Backup failed, continuing anyway:\n{e!r}")
+
         folder_skip = (db.get_state("folder_skip_enabled", "0") == "1")
         sevenzip_path = detect_7z(db.get_state("7z_path", None))
         if sevenzip_path:

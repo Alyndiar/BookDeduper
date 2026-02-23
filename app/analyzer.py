@@ -88,14 +88,22 @@ class AnalyzeWorker(QObject):
         ts = now_ts()
         self.db.execute("DELETE FROM known_authors")
         self.db.execute("DELETE FROM author_variants")
+        known_rows = []
+        variant_rows = []
         for norm, info in temp_counts.items():
-            self.db.execute(
+            canonical = str(info["canonical"])
+            freq = int(info["frequency"])
+            known_rows.append((norm, canonical, freq, ts, ts))
+            variant_rows.append((norm, canonical, freq, ts))
+        if known_rows:
+            self.db.executemany(
                 "INSERT INTO known_authors(normalized_name,canonical_name,frequency,created_at,updated_at) VALUES(?,?,?,?,?)",
-                (norm, str(info["canonical"]), int(info["frequency"]), ts, ts),
+                known_rows,
             )
-            self.db.execute(
+        if variant_rows:
+            self.db.executemany(
                 "INSERT INTO author_variants(normalized_name,variant_text,frequency,updated_at) VALUES(?,?,?,?)",
-                (norm, str(info["canonical"]), int(info["frequency"]), ts),
+                variant_rows,
             )
 
         known_for_suggest = [(k, str(v["canonical"]), int(v["frequency"])) for k, v in temp_counts.items()]
@@ -118,6 +126,34 @@ class AnalyzeWorker(QObject):
             return False, "Analyze Authors aborted."
         return True, "Analyze Authors completed."
 
+
+    def _load_duplicate_rows_in_memory(self, last_key: str) -> Dict[str, List[dict]]:
+        if last_key:
+            rows = self.db.query_all(
+                """
+                SELECT work_key,id,path,name,ext,is_archive,inner_ext_guess,size,mtime_ns,tags
+                FROM files
+                WHERE work_key > ?
+                ORDER BY work_key
+                """,
+                (last_key,),
+            )
+        else:
+            rows = self.db.query_all(
+                """
+                SELECT work_key,id,path,name,ext,is_archive,inner_ext_guess,size,mtime_ns,tags
+                FROM files
+                ORDER BY work_key
+                """
+            )
+        grouped: Dict[str, List[dict]] = {}
+        for r in rows:
+            wk = str(r["work_key"] or "")
+            if not wk:
+                continue
+            grouped.setdefault(wk, []).append(dict(r))
+        return grouped
+
     def _run_analyze_duplicates(self) -> Tuple[bool, str]:
         if self.db.get_state("scan_completed", "0") != "1":
             return False, "Scan must complete before Analyze Duplicates."
@@ -129,13 +165,16 @@ class AnalyzeWorker(QObject):
         stats = {"works": 0, "works_with_dupes": 0, "queued": 0}
         self.stats.emit(stats.copy())
 
-        if last_key:
+        memory_profile = (self.db.get_state("memory_profile", "balanced") or "balanced").lower()
+        in_memory_queue = [] if memory_profile == "extreme" else None
+        grouped_rows = self._load_duplicate_rows_in_memory(last_key) if memory_profile == "extreme" else None
+
+        if grouped_rows is not None:
+            works = [{"work_key": wk} for wk in grouped_rows.keys()]
+        elif last_key:
             works = self.db.query_all("SELECT work_key FROM works WHERE work_key > ? ORDER BY work_key", (last_key,))
         else:
             works = self.db.query_all("SELECT work_key FROM works ORDER BY work_key")
-
-        memory_profile = (self.db.get_state("memory_profile", "balanced") or "balanced").lower()
-        in_memory_queue = [] if memory_profile == "extreme" else None
 
         self.db.begin()
         try:
@@ -152,10 +191,13 @@ class AnalyzeWorker(QObject):
                     self.progress.emit(f"Analyzing duplicates {stats['works']}: {work_key[:60]}")
                     self.stats.emit(stats.copy())
 
-                rows = self.db.query_all(
-                    "SELECT id,path,name,ext,is_archive,inner_ext_guess,size,mtime_ns,tags FROM files WHERE work_key=?",
-                    (work_key,),
-                )
+                if grouped_rows is not None:
+                    rows = grouped_rows.get(work_key, [])
+                else:
+                    rows = self.db.query_all(
+                        "SELECT id,path,name,ext,is_archive,inner_ext_guess,size,mtime_ns,tags FROM files WHERE work_key=?",
+                        (work_key,),
+                    )
                 if len(rows) <= 1:
                     self.db.set_state("analyze_last_work_key", work_key)
                     continue
