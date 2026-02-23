@@ -38,8 +38,6 @@ class AuthorsTab(QWidget):
 
         lay.addLayout(btns)
 
-        self.tab_status = QLabel("Authors DB: valid=0 invalid=0")
-        lay.addWidget(self.tab_status)
 
     def _selected_norm(self, list_widget: QListWidget):
         item = list_widget.currentItem()
@@ -47,10 +45,6 @@ class AuthorsTab(QWidget):
             return None
         return str(item.data(256) or "")
 
-    def set_status(self, stats: dict):
-        self.tab_status.setText(
-            f"Authors DB: valid={stats.get('authors', 0)} invalid={stats.get('invalid_authors', 0)}"
-        )
 
     def refresh(self):
         db = self.get_db()
@@ -69,7 +63,6 @@ class AuthorsTab(QWidget):
             it.setData(256, r["normalized_name"])
             self.invalid_list.addItem(it)
         self.top.setText(f"Author DB: valid={len(valid)} invalid={len(invalid)}")
-        self.tab_status.setText(f"Authors DB: valid={len(valid)} invalid={len(invalid)}")
 
     def mark_invalid(self):
         db = self.get_db()

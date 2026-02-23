@@ -52,18 +52,41 @@ class MainWindow(QMainWindow):
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
-        self.status_label = QLabel("Ready")
-        self.status.addWidget(self.status_label, 1)
-        self.read_box = self._make_io_box("R")
-        self.write_box = self._make_io_box("W")
-        self.status.addPermanentWidget(self.read_box)
-        self.status.addPermanentWidget(self.write_box)
-        self._set_io_box(self.read_box, "black")
-        self._set_io_box(self.write_box, "black")
+        self._build_global_status_bar()
 
         self.io_signal.connect(self._on_io_signal)
 
         self.resize(1200, 800)
+
+    def _build_global_status_bar(self):
+        self.status_label = QLabel("Status: Ready")
+        self.dirs_label = QLabel("Dirs: 0")
+        self.files_label = QLabel("Files: 0")
+        self.authors_label = QLabel("Authors: 0")
+        self.groups_files_label = QLabel("Groups/files: 0/0")
+        self.left_label = QLabel("Left: 0/0")
+
+        self.status.addWidget(QLabel("|"))
+        self.status.addWidget(self.status_label)
+        self.status.addWidget(QLabel("|"))
+        self.status.addWidget(self.dirs_label)
+        self.status.addWidget(QLabel("|"))
+        self.status.addWidget(self.files_label)
+        self.status.addWidget(QLabel("|"))
+        self.status.addWidget(self.authors_label)
+        self.status.addWidget(QLabel("|"))
+        self.status.addWidget(self.groups_files_label)
+        self.status.addWidget(QLabel("|"))
+        self.status.addWidget(self.left_label)
+        self.status.addWidget(QLabel("|"), 1)
+
+        self.read_box = self._make_io_box("R")
+        self.write_box = self._make_io_box("W")
+        self.status.addPermanentWidget(self.read_box)
+        self.status.addPermanentWidget(self.write_box)
+        self.status.addPermanentWidget(QLabel("|"))
+        self._set_io_box(self.read_box, "black")
+        self._set_io_box(self.write_box, "black")
 
     def _make_io_box(self, label: str) -> QLabel:
         box = QLabel(label)
@@ -77,6 +100,9 @@ class MainWindow(QMainWindow):
         pal.setColor(QPalette.Window, QColor(color))
         box.setPalette(pal)
 
+    def _set_status_text(self, text: str):
+        self.status_label.setText(f"Status: {text}")
+
     def _io_callback(self, operation: str, active: bool):
         self.io_signal.emit(operation, active)
 
@@ -87,12 +113,13 @@ class MainWindow(QMainWindow):
         else:
             self._io_writes = max(0, self._io_writes + (1 if active else -1))
             self._set_io_box(self.write_box, "red" if self._io_writes > 0 else "black")
+
         if self._io_writes > 0:
-            self.status_label.setText("Saving to disk…")
+            self._set_status_text("Saving")
         elif self._io_reads > 0:
-            self.status_label.setText("Reading from disk…")
+            self._set_status_text("Reading")
         else:
-            self.status_label.setText("Ready")
+            self._set_status_text("Ready")
 
     def _safe_i(self, row, key: str) -> int:
         if not row:
@@ -131,16 +158,22 @@ class MainWindow(QMainWindow):
             "invalid_authors": invalid,
         }
 
+    def _update_global_counts(self, st: dict):
+        self.dirs_label.setText(f"Dirs: {st.get('folders', 0)}")
+        self.files_label.setText(f"Files: {st.get('files', 0)}")
+        self.authors_label.setText(f"Authors: {st.get('authors', 0)}")
+        self.groups_files_label.setText(
+            f"Groups/files: {st.get('dup_found_groups', 0)}/{st.get('dup_found_files', 0)}"
+        )
+        self.left_label.setText(
+            f"Left: {st.get('dup_todo_groups', 0)}/{st.get('dup_todo_files', 0)}"
+        )
+
     def refresh_all_statuses(self):
         st = self._collect_stats()
         if not st:
             return
-        self.project_tab.set_project_status(st)
-        self.roots_tab.set_status(st)
-        self.scan_tab.set_status(st)
-        self.analyze_tab.set_status(st)
-        self.review_tab.set_status(st)
-        self.authors_tab.set_status(st)
+        self._update_global_counts(st)
 
     def on_project_opened(self, db: DB):
         if self.db:
@@ -203,17 +236,17 @@ class MainWindow(QMainWindow):
         # Ensure processing is safely stopped so resumable checkpoints are persisted.
         try:
             if self.scan_tab.thread and self.scan_tab.worker:
-                self.status_label.setText("Stopping scan and saving checkpoint…")
+                self._set_status_text("Stopping scan + saving")
                 self.scan_tab.worker.request_stop()
                 self.scan_tab.thread.quit()
                 self.scan_tab.thread.wait(30000)
             if self.analyze_tab.thread and self.analyze_tab.worker:
-                self.status_label.setText("Stopping analyze and saving progress…")
+                self._set_status_text("Stopping analyze + saving")
                 self.analyze_tab.worker.request_stop()
                 self.analyze_tab.thread.quit()
                 self.analyze_tab.thread.wait(30000)
             if self.db:
-                self.status_label.setText("Final save to disk…")
+                self._set_status_text("Final save")
                 self.db.commit()
         except Exception:
             pass
