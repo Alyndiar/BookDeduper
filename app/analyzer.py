@@ -192,9 +192,9 @@ class AnalyzeWorker(QObject):
                     pct = 100.0
                 else:
                     pct = (done * 100.0) / total
+                # Qt queued signal delivery keeps UI updates asynchronous.
                 self.progress_percent.emit(pct, "authors_suggestions")
-                # Emit readable milestones without flooding the log panel.
-                if done == 0 or done == total or (done % 250000 == 0):
+                if done == 0 or done == total:
                     self.progress.emit(f"Analyze Authors: merge suggestions {pct:.2f}% ({done}/{total} pairs)")
                 self._maybe_pause()
                 if self._stop:
@@ -204,7 +204,7 @@ class AnalyzeWorker(QObject):
                 suggestions = build_merge_suggestions([
                     (str(r["normalized_name"]), str(r["canonical_name"]), int(r["frequency"] or 0))
                     for r in rows
-                ], progress_cb=_on_pair_progress)
+                ], progress_cb=_on_pair_progress, progress_interval_s=10.0)
                 suggestions_count = len(suggestions)
             except InterruptedError:
                 return False, "Analyze Authors aborted (progress saved)."

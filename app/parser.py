@@ -3,6 +3,7 @@ import os
 import re
 import unicodedata
 import logging
+import time
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Optional, Tuple, List, Dict, Any, Callable
@@ -376,10 +377,16 @@ def build_merge_suggestions(
     threshold: float = 0.92,
     progress_cb: Optional[Callable[[int, int], None]] = None,
     progress_every: int = 50000,
+    progress_interval_s: float = 10.0,
 ) -> List[MergeSuggestion]:
     suggestions: List[MergeSuggestion] = []
     total_pairs = (len(known_authors) * (len(known_authors) - 1)) // 2
     checked_pairs = 0
+    # Throttle callback work: progress updates at most every N seconds.
+    now = time.monotonic()
+    next_emit_ts = now + max(float(progress_interval_s), 0.1)
+    check_every = max(int(progress_every), 1)
+
     if progress_cb:
         progress_cb(0, total_pairs)
 
@@ -403,12 +410,11 @@ def build_merge_suggestions(
                 auto_merge_safe = sim >= 0.98 and _punctuation_only_variant(ld, rd)
                 suggestions.append(MergeSuggestion(ld, rd, sim, reason, auto_merge_safe))
 
-            if progress_cb and (
-                checked_pairs == total_pairs
-                or checked_pairs == 1
-                or checked_pairs % max(int(progress_every), 1) == 0
-            ):
-                progress_cb(checked_pairs, total_pairs)
+            if progress_cb and (checked_pairs == total_pairs or checked_pairs % check_every == 0):
+                now = time.monotonic()
+                if checked_pairs == total_pairs or now >= next_emit_ts:
+                    progress_cb(checked_pairs, total_pairs)
+                    next_emit_ts = now + max(float(progress_interval_s), 0.1)
 
     suggestions.sort(key=lambda s: (s.similarity, s.left_name, s.right_name), reverse=True)
     logger.debug("merge_suggestions count=%s total_pairs=%s", len(suggestions), total_pairs)
