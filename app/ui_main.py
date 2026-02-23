@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Signal
-from PySide6.QtGui import QColor, QCloseEvent, QPalette, QFontDatabase, QFontMetrics
+from PySide6.QtGui import QCloseEvent, QFontDatabase, QFontMetrics
 from PySide6.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QTabWidget, QLabel, QStatusBar
 
 from .db import DB
@@ -113,9 +113,9 @@ class MainWindow(QMainWindow):
         return box
 
     def _set_io_box(self, box: QLabel, color: str):
-        pal = box.palette()
-        pal.setColor(QPalette.Window, QColor(color))
-        box.setPalette(pal)
+        box.setStyleSheet(
+            f"QLabel {{ background-color: {color}; color: white; font-weight: bold; border: 1px solid #555; padding: 2px; text-align: center; }}"
+        )
 
     def _io_callback(self, operation: str, active: bool):
         self.io_signal.emit(operation, active)
