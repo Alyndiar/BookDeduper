@@ -139,7 +139,11 @@ class MainWindow(QMainWindow):
         if self.scan_tab.thread is not None:
             return "Scanning"
         if self.analyze_tab.thread is not None:
-            return "Analyze Authors" if self.analyze_tab.current_phase == "authors" else "Analyze Duplicates"
+            if self.analyze_tab.current_phase == "authors":
+                return "Analyze Authors"
+            if self.analyze_tab.current_phase == "authors_seed":
+                return "Pre-seed Authors"
+            return "Analyze Duplicates"
         idx = self.tabs.currentIndex()
         if idx == 4:
             return "Review"

@@ -36,6 +36,10 @@ class AnalyzeTab(QWidget):
         lay.addWidget(self.log, 1)
 
         row = QHBoxLayout()
+        self.btn_preseed = QPushButton("Pre-seed Authors")
+        self.btn_preseed.clicked.connect(lambda: self.start("authors_seed"))
+        row.addWidget(self.btn_preseed)
+
         self.btn_authors = QPushButton("Analyze Authors")
         self.btn_authors.clicked.connect(lambda: self.start("authors"))
         row.addWidget(self.btn_authors)
@@ -72,6 +76,7 @@ class AnalyzeTab(QWidget):
             self.status.setText("Analyze status: (no project)")
             return
         scan_done = (db.get_state("scan_completed", "0") == "1")
+        self.btn_preseed.setEnabled(scan_done and self.thread is None)
         self.btn_authors.setEnabled(scan_done and self.thread is None)
         self.btn_duplicates.setEnabled(scan_done and self.thread is None)
         last = db.get_state("analyze_last_work_key", "")
@@ -106,6 +111,7 @@ class AnalyzeTab(QWidget):
         self.worker.stats.connect(self.on_stats)
         self.worker.finished.connect(self.on_finished)
 
+        self.btn_preseed.setEnabled(False)
         self.btn_authors.setEnabled(False)
         self.btn_duplicates.setEnabled(False)
         self.btn_pause.setEnabled(True)
@@ -116,7 +122,13 @@ class AnalyzeTab(QWidget):
         self.progress_bar.setFormat("0.00%")
         self.append(f"=== {phase} started ===")
         if self.on_activity_progress:
-            self.on_activity_progress("Analyze Authors" if phase == "authors" else "Analyze Duplicates", 0.0)
+            if phase == "authors":
+                label = "Analyze Authors"
+            elif phase == "authors_seed":
+                label = "Pre-seed Authors"
+            else:
+                label = "Analyze Duplicates"
+            self.on_activity_progress(label, 0.0)
         self.thread.start()
 
     def pause(self):
@@ -169,6 +181,7 @@ class AnalyzeTab(QWidget):
         self.thread = None
         self.worker = None
 
+        self.btn_preseed.setEnabled(True)
         self.btn_authors.setEnabled(True)
         self.btn_duplicates.setEnabled(True)
         self.btn_pause.setEnabled(False)

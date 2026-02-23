@@ -45,6 +45,8 @@ class AnalyzeWorker(QObject):
             self._maybe_backup_before_phase(self.phase)
             if self.phase == "authors":
                 ok, msg = self._run_analyze_authors()
+            elif self.phase == "authors_seed":
+                ok, msg = self._run_preseed_authors()
             else:
                 ok, msg = self._run_analyze_duplicates()
             self.finished.emit(ok, msg)
@@ -113,12 +115,19 @@ class AnalyzeWorker(QObject):
                 variant_rows,
             )
 
-    def _run_analyze_authors(self) -> Tuple[bool, str]:
-        if self.db.get_state("scan_completed", "0") != "1":
-            return False, "Scan must complete before Analyze Authors."
+    def _run_preseed_authors(self) -> Tuple[bool, str]:
+        return self._run_authors_common(finalize_suggestions=False)
 
-        self.db.set_state("last_action", "analyze_authors")
+    def _run_analyze_authors(self) -> Tuple[bool, str]:
+        return self._run_authors_common(finalize_suggestions=True)
+
+    def _run_authors_common(self, finalize_suggestions: bool) -> Tuple[bool, str]:
+        if self.db.get_state("scan_completed", "0") != "1":
+            return False, "Scan must complete before author pre-seed/analyze."
+
+        self.db.set_state("last_action", "analyze_authors" if finalize_suggestions else "preseed_authors")
         self.db.set_state("analyze_authors_completed", "0")
+        self.db.set_state("analyze_authors_seed_completed", "0")
         self.progress_percent.emit(0.0, "authors_suggestions")
         invalid_set = self._load_invalid_set()
         dirty = (self.db.get_state("author_db_dirty", "0") == "1")
@@ -139,9 +148,11 @@ class AnalyzeWorker(QObject):
 
         files = self.db.query_all("SELECT id,name FROM files WHERE id > ? ORDER BY id", (last_id,))
         if not files:
-            self.db.set_state("analyze_authors_completed", "1")
+            self.db.set_state("analyze_authors_seed_completed", "1")
+            if finalize_suggestions:
+                self.db.set_state("analyze_authors_completed", "1")
             self.db.set_state("author_db_dirty", "0")
-            return True, "Analyze Authors completed (no pending files)."
+            return True, "Author pre-seed completed (no pending files)."
 
         chunk_size = self._authors_chunk_size()
         known_delta: Dict[str, Dict[str, object]] = {}
@@ -183,7 +194,7 @@ class AnalyzeWorker(QObject):
 
                 processed += 1
                 if processed % 500 == 0:
-                    self.progress.emit(f"Analyze Authors: +{processed} (last_file_id={fid})")
+                    self.progress.emit(f"Author pre-seed: +{processed} (last_file_id={fid})")
 
                 if processed % chunk_size == 0:
                     ts = now_ts()
@@ -194,7 +205,7 @@ class AnalyzeWorker(QObject):
                     self.db.commit()
                     self.db.begin()
 
-            self.progress.emit("Analyze Authors: flushing final author deltas…")
+            self.progress.emit("Author pre-seed: flushing final author deltas…")
             ts = now_ts()
             self._flush_author_deltas(known_delta, variant_delta, ts)
             if files:
@@ -204,6 +215,12 @@ class AnalyzeWorker(QObject):
         except Exception:
             self.db.rollback()
             raise
+
+        self.db.set_state("analyze_authors_seed_completed", "1")
+
+        if not finalize_suggestions:
+            self.db.set_state("author_db_dirty", "0")
+            return True, "Author pre-seed completed. Run Analyze Authors to finalize suggestions."
 
         # recompute suggestions from persisted known_authors only when completed.
         # This step is O(n²); emit percentage progress so long runs remain observable.
@@ -232,7 +249,7 @@ class AnalyzeWorker(QObject):
                 ], progress_cb=_on_pair_progress, progress_interval_s=10.0)
                 suggestions_count = len(suggestions)
             except InterruptedError:
-                return False, "Analyze Authors aborted (progress saved)."
+                return False, "Analyze Authors aborted during suggestion finalization (pre-seed saved)."
 
             logger.debug("author_db_rebuilt authors=%s suggestions=%s", author_count, suggestions_count)
             self.progress_percent.emit(100.0, "authors_suggestions")
@@ -240,7 +257,7 @@ class AnalyzeWorker(QObject):
             self.db.set_state("author_db_dirty", "0")
             return True, "Analyze Authors completed."
 
-        return False, "Analyze Authors aborted (progress saved)."
+        return False, "Analyze Authors aborted (pre-seed progress saved)."
 
     def _load_duplicate_rows_in_memory(self, last_key: str) -> Dict[str, List[dict]]:
         if last_key:

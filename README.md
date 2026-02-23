@@ -38,13 +38,13 @@ python main.py
 2. In **1) Project**, open or create a `.sqlite` project file.
 3. In **2) Roots**, add one or more library folders.
 4. In **3) Scan**, run scan (pause/resume supported).
-5. In **4) Analyze**, generate duplicate recommendations.
+5. In **4) Analyze**, optionally run **Pre-seed Authors** to build tentative/variant author data first, then run **Analyze Authors** to finalize merge suggestions, and **Analyze Duplicates** for deletion recommendations.
 6. In **5) Review/Delete**, inspect per-work decisions and delete checked files to recycle bin.
 
 ## Notes
 
 - The app stores operational state (last actions, scan checkpoints, settings) inside the project DB.
-- Analyze requires a completed scan.
+- Analyze requires a completed scan. Author pre-seeding is a separate Analyze action you can run before full author analysis.
 - Review/Delete requires completed analysis.
 - If 7-Zip is unavailable, archive inner format guessing falls back to filename tags only.
 
