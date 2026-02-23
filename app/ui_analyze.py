@@ -4,6 +4,14 @@ from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QL
 from .analyzer import AnalyzeWorker
 
 class AnalyzeTab(QWidget):
+    def _analyze_commit_every(self, profile: str) -> int:
+        p = (profile or "balanced").lower()
+        if p == "safe":
+            return 1500
+        if p == "extreme":
+            return 12000
+        return 5000
+
     def __init__(self, get_db, on_analyze_completed):
         super().__init__()
         self.get_db = get_db
@@ -77,7 +85,8 @@ class AnalyzeTab(QWidget):
 
         self.current_phase = phase
         self.thread = QThread()
-        self.worker = AnalyzeWorker(db, phase=phase)
+        commit_every = self._analyze_commit_every(db.get_state("memory_profile", "balanced"))
+        self.worker = AnalyzeWorker(db, phase=phase, commit_every=commit_every)
         self.worker.moveToThread(self.thread)
 
         self.thread.started.connect(self.worker.run)

@@ -4,6 +4,27 @@ from typing import Iterable, Optional
 
 SCHEMA_VERSION = 4
 
+MEMORY_PROFILES = {
+    "safe": {
+        "cache_size": -131072,      # 128 MiB
+        "mmap_size": 268435456,     # 256 MiB
+        "wal_autocheckpoint": 2000,
+        "synchronous": "NORMAL",
+    },
+    "balanced": {
+        "cache_size": -524288,      # 512 MiB
+        "mmap_size": 1073741824,    # 1 GiB
+        "wal_autocheckpoint": 8000,
+        "synchronous": "NORMAL",
+    },
+    "extreme": {
+        "cache_size": -2097152,     # 2 GiB
+        "mmap_size": 4294967296,    # 4 GiB
+        "wal_autocheckpoint": 20000,
+        "synchronous": "NORMAL",
+    },
+}
+
 SCHEMA = r"""
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
@@ -111,6 +132,7 @@ class DB:
         self.conn = sqlite3.connect(db_path, isolation_level=None, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._init_schema()
+        self.apply_memory_profile(self.get_state("memory_profile", "balanced") or "balanced")
 
     def _init_schema(self):
         cur = self.conn.cursor()
@@ -185,6 +207,24 @@ class DB:
             version = 4
 
         self.set_state("schema_version", str(max(version, SCHEMA_VERSION)))
+
+
+    def apply_memory_profile(self, profile: str):
+        profile = (profile or "balanced").strip().lower()
+        if profile not in MEMORY_PROFILES:
+            profile = "balanced"
+        cfg = MEMORY_PROFILES[profile]
+        self.execute(f"PRAGMA synchronous={cfg['synchronous']};")
+        self.execute("PRAGMA temp_store=MEMORY;")
+        self.execute("PRAGMA cache_spill=OFF;")
+        self.execute("PRAGMA cache_size=?;", (int(cfg["cache_size"]),))
+        self.execute("PRAGMA mmap_size=?;", (int(cfg["mmap_size"]),))
+        self.execute("PRAGMA wal_autocheckpoint=?;", (int(cfg["wal_autocheckpoint"]),))
+        self.set_state("memory_profile", profile)
+
+    def memory_profile(self) -> str:
+        p = (self.get_state("memory_profile", "balanced") or "balanced").strip().lower()
+        return p if p in MEMORY_PROFILES else "balanced"
 
     def close(self):
         self.conn.close()

@@ -2,7 +2,7 @@ from __future__ import annotations
 import os
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
-    QFileDialog, QLineEdit, QMessageBox, QCheckBox
+    QFileDialog, QLineEdit, QMessageBox, QCheckBox, QComboBox
 )
 from .db import DB
 from .sevenzip import detect_7z
@@ -44,6 +44,14 @@ class ProjectTab(QWidget):
         self.chk_folder_skip.stateChanged.connect(self.save_settings_if_open)
         srow.addWidget(self.chk_folder_skip)
         lay.addLayout(srow)
+
+        mrow = QHBoxLayout()
+        mrow.addWidget(QLabel("Memory profile:"))
+        self.cmb_memory_profile = QComboBox()
+        self.cmb_memory_profile.addItems(["safe", "balanced", "extreme"])
+        self.cmb_memory_profile.currentTextChanged.connect(self.save_settings_if_open)
+        mrow.addWidget(self.cmb_memory_profile)
+        lay.addLayout(mrow)
 
         zrow = QHBoxLayout()
         self.zlabel = QLabel("7z.exe: (auto-detect after open)")
@@ -91,6 +99,10 @@ class ProjectTab(QWidget):
         folder_skip = (db.get_state("folder_skip_enabled", "0") == "1")
         self.chk_folder_skip.setChecked(folder_skip)
 
+        profile = db.memory_profile()
+        self.cmb_memory_profile.setCurrentText(profile)
+        db.apply_memory_profile(profile)
+
         existing = db.get_state("7z_path", None)
         p = detect_7z(existing)
         if p:
@@ -105,6 +117,7 @@ class ProjectTab(QWidget):
         if not self._db:
             return
         self._db.set_state("folder_skip_enabled", "1" if self.chk_folder_skip.isChecked() else "0")
+        self._db.apply_memory_profile(self.cmb_memory_profile.currentText())
 
     def redetect_7z(self):
         if not self._db:

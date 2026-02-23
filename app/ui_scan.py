@@ -5,6 +5,14 @@ from .scanner import ScanWorker, ScanConfig
 from .sevenzip import detect_7z
 
 class ScanTab(QWidget):
+    def _scan_tuning(self, profile: str) -> dict:
+        p = (profile or "balanced").lower()
+        if p == "safe":
+            return {"commit_every": 2500, "checkpoint_every_s": 1.0}
+        if p == "extreme":
+            return {"commit_every": 20000, "checkpoint_every_s": 4.0}
+        return {"commit_every": 8000, "checkpoint_every_s": 2.0}
+
     def __init__(self, get_db, on_scan_completed):
         super().__init__()
         self.get_db = get_db
@@ -71,7 +79,8 @@ class ScanTab(QWidget):
         if sevenzip_path:
             db.set_state("7z_path", sevenzip_path)
 
-        cfg = ScanConfig(folder_skip_enabled=folder_skip, sevenzip_path=sevenzip_path)
+        tuning = self._scan_tuning(db.get_state("memory_profile", "balanced"))
+        cfg = ScanConfig(folder_skip_enabled=folder_skip, sevenzip_path=sevenzip_path, commit_every=tuning["commit_every"], checkpoint_every_s=tuning["checkpoint_every_s"])
 
         self.thread = QThread()
         self.worker = ScanWorker(db, cfg)
