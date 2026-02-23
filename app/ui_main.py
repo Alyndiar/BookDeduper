@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Signal
-from PySide6.QtGui import QColor, QCloseEvent, QPalette
+from PySide6.QtGui import QColor, QCloseEvent, QPalette, QFontDatabase, QFontMetrics
 from PySide6.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QTabWidget, QLabel, QStatusBar
 
 from .db import DB
@@ -26,7 +26,7 @@ class MainWindow(QMainWindow):
 
         self.tabs = QTabWidget()
         self.tabs.setTabsClosable(False)
-        self.tabs.currentChanged.connect(lambda _: self.refresh_all_statuses())
+        self.tabs.currentChanged.connect(self._on_tab_changed)
 
         self.project_tab = ProjectTab(on_project_opened=self.on_project_opened)
         self.roots_tab = RootsTab(get_db=lambda: self.db)
@@ -56,43 +56,72 @@ class MainWindow(QMainWindow):
 
         self.io_signal.connect(self._on_io_signal)
 
-        self.resize(1200, 800)
+        self.resize(max(1200, self._status_required_width + 80), 800)
 
     def _build_global_status_bar(self):
-        self.status_label = QLabel("Status: Ready")
-        self.dirs_label = QLabel("Dirs: 0")
-        self.files_label = QLabel("Files: 0")
-        self.authors_label = QLabel("Authors: 0")
-        self.groups_files_label = QLabel("Groups/files: 0/0")
-        self.left_label = QLabel("Left: 0/0")
+        mono = QFontDatabase.systemFont(QFontDatabase.FixedFont)
+        mono.setPointSize(max(8, mono.pointSize() - 1))
+        fm = QFontMetrics(mono)
 
-        self.status.addWidget(QLabel("|"))
+        self.status_label = self._make_field_label(mono, "Analyze Duplicates")
+        self.dirs_label = self._make_field_label(mono, "Dirs 9999999999")
+        self.files_label = self._make_field_label(mono, "Files 9999999999")
+        self.authors_label = self._make_field_label(mono, "Authors 9999999999")
+        self.groups_files_label = self._make_field_label(mono, "Groups/files 9999999999/9999999999")
+        self.left_label = self._make_field_label(mono, "Left 9999999999/9999999999")
+
+        self._set_field_texts("Idle", 0, 0, 0, 0, 0, 0, 0)
+
+        sep_w = fm.horizontalAdvance(" | ") + 4
+        self._status_required_width = (
+            self.status_label.width()
+            + self.dirs_label.width()
+            + self.files_label.width()
+            + self.authors_label.width()
+            + self.groups_files_label.width()
+            + self.left_label.width()
+            + (6 * sep_w)
+            + 60
+        )
+
         self.status.addWidget(self.status_label)
-        self.status.addWidget(QLabel("|"))
+        self.status.addWidget(self._make_sep(mono))
         self.status.addWidget(self.dirs_label)
-        self.status.addWidget(QLabel("|"))
+        self.status.addWidget(self._make_sep(mono))
         self.status.addWidget(self.files_label)
-        self.status.addWidget(QLabel("|"))
+        self.status.addWidget(self._make_sep(mono))
         self.status.addWidget(self.authors_label)
-        self.status.addWidget(QLabel("|"))
+        self.status.addWidget(self._make_sep(mono))
         self.status.addWidget(self.groups_files_label)
-        self.status.addWidget(QLabel("|"))
+        self.status.addWidget(self._make_sep(mono))
         self.status.addWidget(self.left_label)
-        self.status.addWidget(QLabel("|"), 1)
+        self.status.addWidget(self._make_sep(mono), 1)
 
-        self.read_box = self._make_io_box("R")
-        self.write_box = self._make_io_box("W")
+        self.read_box = self._make_io_box("R", mono)
+        self.write_box = self._make_io_box("W", mono)
         self.status.addPermanentWidget(self.read_box)
         self.status.addPermanentWidget(self.write_box)
-        self.status.addPermanentWidget(QLabel("|"))
         self._set_io_box(self.read_box, "black")
         self._set_io_box(self.write_box, "black")
 
-    def _make_io_box(self, label: str) -> QLabel:
+    def _make_field_label(self, font, template: str) -> QLabel:
+        fm = QFontMetrics(font)
+        label = QLabel("")
+        label.setFont(font)
+        label.setFixedWidth(fm.horizontalAdvance(template) + 10)
+        return label
+
+    def _make_sep(self, font) -> QLabel:
+        lbl = QLabel("|")
+        lbl.setFont(font)
+        return lbl
+
+    def _make_io_box(self, label: str, font) -> QLabel:
         box = QLabel(label)
+        box.setFont(font)
         box.setFixedWidth(24)
         box.setAutoFillBackground(True)
-        box.setStyleSheet("QLabel { color: white; font-weight: bold; border: 1px solid #555; padding: 2px; }")
+        box.setStyleSheet("QLabel { color: white; font-weight: bold; border: 1px solid #555; padding: 2px; text-align: center; }")
         return box
 
     def _set_io_box(self, box: QLabel, color: str):
@@ -100,11 +129,23 @@ class MainWindow(QMainWindow):
         pal.setColor(QPalette.Window, QColor(color))
         box.setPalette(pal)
 
-    def _set_status_text(self, text: str):
-        self.status_label.setText(f"Status: {text}")
-
     def _io_callback(self, operation: str, active: bool):
         self.io_signal.emit(operation, active)
+
+    def _current_mode(self) -> str:
+        if self._io_reads > 0 or self._io_writes > 0:
+            return "Disk IO"
+        if self.scan_tab.thread is not None:
+            return "Scanning"
+        if self.analyze_tab.thread is not None:
+            return "Analyze Authors" if self.analyze_tab.current_phase == "authors" else "Analyze Duplicates"
+        idx = self.tabs.currentIndex()
+        if idx == 4:
+            return "Review"
+        return "Idle"
+
+    def _on_tab_changed(self, _idx: int):
+        self.refresh_all_statuses()
 
     def _on_io_signal(self, operation: str, active: bool):
         if operation == "read":
@@ -113,13 +154,7 @@ class MainWindow(QMainWindow):
         else:
             self._io_writes = max(0, self._io_writes + (1 if active else -1))
             self._set_io_box(self.write_box, "red" if self._io_writes > 0 else "black")
-
-        if self._io_writes > 0:
-            self._set_status_text("Saving")
-        elif self._io_reads > 0:
-            self._set_status_text("Reading")
-        else:
-            self._set_status_text("Ready")
+        self.refresh_all_statuses()
 
     def _safe_i(self, row, key: str) -> int:
         if not row:
@@ -141,9 +176,6 @@ class MainWindow(QMainWindow):
         dup_todo = self.db.query_one(
             "SELECT COUNT(*) AS files, COUNT(DISTINCT work_key) AS groups FROM deletion_queue WHERE checked=1"
         )
-        roots = self._safe_i(self.db.query_one("SELECT COUNT(*) AS c FROM roots"), "c")
-        roots_on = self._safe_i(self.db.query_one("SELECT COUNT(*) AS c FROM roots WHERE enabled=1"), "c")
-        invalid = self._safe_i(self.db.query_one("SELECT COUNT(*) AS c FROM invalid_authors"), "c")
 
         return {
             "files": files,
@@ -153,27 +185,31 @@ class MainWindow(QMainWindow):
             "dup_found_groups": self._safe_i(dup_found, "groups"),
             "dup_todo_files": self._safe_i(dup_todo, "files"),
             "dup_todo_groups": self._safe_i(dup_todo, "groups"),
-            "roots": roots,
-            "roots_enabled": roots_on,
-            "invalid_authors": invalid,
         }
 
-    def _update_global_counts(self, st: dict):
-        self.dirs_label.setText(f"Dirs: {st.get('folders', 0)}")
-        self.files_label.setText(f"Files: {st.get('files', 0)}")
-        self.authors_label.setText(f"Authors: {st.get('authors', 0)}")
-        self.groups_files_label.setText(
-            f"Groups/files: {st.get('dup_found_groups', 0)}/{st.get('dup_found_files', 0)}"
-        )
-        self.left_label.setText(
-            f"Left: {st.get('dup_todo_groups', 0)}/{st.get('dup_todo_files', 0)}"
-        )
+    def _set_field_texts(self, mode: str, dirs: int, files: int, authors: int, found_groups: int, found_files: int, left_groups: int, left_files: int):
+        self.status_label.setText(mode)
+        self.dirs_label.setText(f"Dirs {dirs}")
+        self.files_label.setText(f"Files {files}")
+        self.authors_label.setText(f"Authors {authors}")
+        self.groups_files_label.setText(f"Groups/files {found_groups}/{found_files}")
+        self.left_label.setText(f"Left {left_groups}/{left_files}")
 
     def refresh_all_statuses(self):
         st = self._collect_stats()
         if not st:
+            self._set_field_texts(self._current_mode(), 0, 0, 0, 0, 0, 0, 0)
             return
-        self._update_global_counts(st)
+        self._set_field_texts(
+            self._current_mode(),
+            st.get("folders", 0),
+            st.get("files", 0),
+            st.get("authors", 0),
+            st.get("dup_found_groups", 0),
+            st.get("dup_found_files", 0),
+            st.get("dup_todo_groups", 0),
+            st.get("dup_todo_files", 0),
+        )
 
     def on_project_opened(self, db: DB):
         if self.db:
@@ -236,17 +272,14 @@ class MainWindow(QMainWindow):
         # Ensure processing is safely stopped so resumable checkpoints are persisted.
         try:
             if self.scan_tab.thread and self.scan_tab.worker:
-                self._set_status_text("Stopping scan + saving")
                 self.scan_tab.worker.request_stop()
                 self.scan_tab.thread.quit()
                 self.scan_tab.thread.wait(30000)
             if self.analyze_tab.thread and self.analyze_tab.worker:
-                self._set_status_text("Stopping analyze + saving")
                 self.analyze_tab.worker.request_stop()
                 self.analyze_tab.thread.quit()
                 self.analyze_tab.thread.wait(30000)
             if self.db:
-                self._set_status_text("Final save")
                 self.db.commit()
         except Exception:
             pass
