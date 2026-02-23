@@ -4,6 +4,7 @@ from PySide6.QtWidgets import (
     QFileDialog, QMessageBox, QLabel
 )
 
+
 class RootsTab(QWidget):
     def __init__(self, get_db):
         super().__init__()
@@ -35,6 +36,15 @@ class RootsTab(QWidget):
         row.addStretch(1)
         lay.addLayout(row)
 
+        self.status = QLabel("Roots status: idle")
+        lay.addWidget(self.status)
+
+    def set_status(self, stats: dict):
+        self.status.setText(
+            f"Roots status: roots={stats.get('roots', 0)} enabled={stats.get('roots_enabled', 0)} "
+            f"folders={stats.get('folders', 0)} files={stats.get('files', 0)}"
+        )
+
     def refresh(self):
         db = self.get_db()
         if not db:
@@ -45,6 +55,7 @@ class RootsTab(QWidget):
             item = QListWidgetItem(f"[{'ON' if r['enabled'] else 'OFF'}] {r['path']}")
             item.setData(256, int(r["id"]))
             self.list.addItem(item)
+        self.status.setText(f"Roots status: roots={len(rows)}")
 
     def add_root(self):
         db = self.get_db()

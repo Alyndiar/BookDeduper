@@ -75,6 +75,10 @@ class ProjectTab(QWidget):
         zrow.addWidget(btn_find7z)
         lay.addLayout(zrow)
 
+
+        self.metrics = QLabel("Project DB metrics: folders=0 files=0 authors=0 dup_found=0/0 dup_todo=0/0")
+        lay.addWidget(self.metrics)
+
         lay.addStretch(1)
 
         self._db: DB | None = None
@@ -139,6 +143,14 @@ class ProjectTab(QWidget):
         self._db.set_state("backup_before_analyze", "1" if self.chk_backup_before_analyze.isChecked() else "0")
         self._db.set_state("backup_before_scan", "1" if self.chk_backup_before_scan.isChecked() else "0")
         self._db.apply_memory_profile(self.cmb_memory_profile.currentText())
+
+    def set_project_status(self, stats: dict):
+        self.metrics.setText(
+            f"Project DB metrics: folders={stats.get('folders', 0)} files={stats.get('files', 0)} "
+            f"authors={stats.get('authors', 0)} dup_found={stats.get('dup_found_files', 0)}/{stats.get('dup_found_groups', 0)} "
+            f"dup_todo={stats.get('dup_todo_files', 0)}/{stats.get('dup_todo_groups', 0)}"
+        )
+
 
     def redetect_7z(self):
         if not self._db:

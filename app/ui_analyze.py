@@ -60,8 +60,18 @@ class AnalyzeTab(QWidget):
 
         lay.addLayout(row)
 
+        self.tab_status = QLabel("Analyze DB: authors=0 dup_found=0/0")
+        lay.addWidget(self.tab_status)
+
         self.thread: QThread | None = None
         self.worker: AnalyzeWorker | None = None
+
+    def set_status(self, stats: dict):
+        self.tab_status.setText(
+            f"Analyze DB: authors={stats.get('authors', 0)} invalid={stats.get('invalid_authors', 0)} "
+            f"dup_found={stats.get('dup_found_files', 0)}/{stats.get('dup_found_groups', 0)}"
+        )
+
 
     def refresh(self):
         db = self.get_db()

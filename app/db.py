@@ -2,7 +2,7 @@ from __future__ import annotations
 import sqlite3
 import os
 import time
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 SCHEMA_VERSION = 4
 
@@ -139,8 +139,30 @@ class DB:
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path, isolation_level=None, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        self._io_callbacks: list[Callable[[str, bool], None]] = []
         self._init_schema()
         self.apply_memory_profile(self.get_state("memory_profile", "balanced") or "balanced")
+
+    def add_io_callback(self, callback: Callable[[str, bool], None]):
+        if callback not in self._io_callbacks:
+            self._io_callbacks.append(callback)
+
+    def remove_io_callback(self, callback: Callable[[str, bool], None]):
+        self._io_callbacks = [cb for cb in self._io_callbacks if cb is not callback]
+
+    def _emit_io(self, operation: str, active: bool):
+        for cb in list(self._io_callbacks):
+            try:
+                cb(operation, active)
+            except Exception:
+                continue
+
+    def _operation_kind(self, sql: str) -> str:
+        head = (sql or "").strip().split(None, 1)
+        token = head[0].upper() if head else ""
+        if token in ("SELECT", "PRAGMA"):
+            return "read"
+        return "write"
 
     def _init_schema(self):
         cur = self.conn.cursor()
@@ -241,11 +263,15 @@ class DB:
         parent = os.path.dirname(backup_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
+        self._emit_io("read", True)
+        self._emit_io("write", True)
         dst = sqlite3.connect(backup_path)
         try:
             self.conn.backup(dst)
         finally:
             dst.close()
+            self._emit_io("read", False)
+            self._emit_io("write", False)
 
     def create_timestamped_backup(self, label: str = "manual") -> str:
         ts = int(time.time())
@@ -259,18 +285,36 @@ class DB:
         self.conn.close()
 
     def execute(self, sql: str, params: tuple = ()):
-        return self.conn.execute(sql, params)
+        op = self._operation_kind(sql)
+        self._emit_io(op, True)
+        try:
+            return self.conn.execute(sql, params)
+        finally:
+            self._emit_io(op, False)
 
     def executemany(self, sql: str, seq: Iterable[tuple]):
-        return self.conn.executemany(sql, seq)
+        op = self._operation_kind(sql)
+        self._emit_io(op, True)
+        try:
+            return self.conn.executemany(sql, seq)
+        finally:
+            self._emit_io(op, False)
 
     def query_one(self, sql: str, params: tuple = ()):
-        cur = self.conn.execute(sql, params)
-        return cur.fetchone()
+        self._emit_io("read", True)
+        try:
+            cur = self.conn.execute(sql, params)
+            return cur.fetchone()
+        finally:
+            self._emit_io("read", False)
 
     def query_all(self, sql: str, params: tuple = ()):
-        cur = self.conn.execute(sql, params)
-        return cur.fetchall()
+        self._emit_io("read", True)
+        try:
+            cur = self.conn.execute(sql, params)
+            return cur.fetchall()
+        finally:
+            self._emit_io("read", False)
 
     def set_state(self, key: str, value: str):
         self.conn.execute(
@@ -284,10 +328,22 @@ class DB:
         return row["value"] if row else default
 
     def begin(self):
-        self.conn.execute("BEGIN;")
+        self._emit_io("write", True)
+        try:
+            self.conn.execute("BEGIN;")
+        finally:
+            self._emit_io("write", False)
 
     def commit(self):
-        self.conn.execute("COMMIT;")
+        self._emit_io("write", True)
+        try:
+            self.conn.execute("COMMIT;")
+        finally:
+            self._emit_io("write", False)
 
     def rollback(self):
-        self.conn.execute("ROLLBACK;")
+        self._emit_io("write", True)
+        try:
+            self.conn.execute("ROLLBACK;")
+        finally:
+            self._emit_io("write", False)

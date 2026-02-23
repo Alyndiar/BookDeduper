@@ -51,8 +51,18 @@ class ScanTab(QWidget):
 
         lay.addLayout(row)
 
+        self.tab_status = QLabel("Scan DB: folders=0 files=0")
+        lay.addWidget(self.tab_status)
+
         self.thread: QThread | None = None
         self.worker: ScanWorker | None = None
+
+    def set_status(self, stats: dict):
+        self.tab_status.setText(
+            f"Scan DB: folders={stats.get('folders', 0)} files={stats.get('files', 0)} "
+            f"dup_found={stats.get('dup_found_files', 0)}/{stats.get('dup_found_groups', 0)}"
+        )
+
 
     def refresh(self):
         db = self.get_db()

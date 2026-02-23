@@ -67,6 +67,15 @@ class ReviewTab(QWidget):
 
         lay.addLayout(row, 1)
 
+        self.tab_status = QLabel("Review queue: groups_to_process=0 files_to_process=0")
+        lay.addWidget(self.tab_status)
+
+    def set_status(self, stats: dict):
+        self.tab_status.setText(
+            f"Review queue: groups_to_process={stats.get('dup_todo_groups', 0)} files_to_process={stats.get('dup_todo_files', 0)} "
+            f"found={stats.get('dup_found_groups', 0)}/{stats.get('dup_found_files', 0)}"
+        )
+
     def refresh(self):
         db = self.get_db()
         if not db:
