@@ -107,6 +107,8 @@ class AnalyzeWorker(QObject):
         if self.db.get_state("scan_completed", "0") != "1":
             return False, "Scan must complete before Analyze Authors."
 
+        self.db.set_state("last_action", "analyze_authors")
+        self.db.set_state("analyze_authors_completed", "0")
         self.progress_percent.emit(0.0, "authors_suggestions")
         invalid_set = self._load_invalid_set()
         dirty = (self.db.get_state("author_db_dirty", "0") == "1")
@@ -265,9 +267,21 @@ class AnalyzeWorker(QObject):
             return False, "Scan must complete before Analyze Duplicates."
 
         self.db.set_state("last_action", "analyze_duplicates")
-        self.db.execute("DELETE FROM deletion_queue")
+        was_completed = (self.db.get_state("analyze_duplicates_completed", self.db.get_state("analyze_completed", "0")) == "1")
 
         last_key = self.db.get_state("analyze_last_work_key", "")
+        is_resume = bool(last_key and not was_completed)
+
+        self.db.set_state("analyze_duplicates_completed", "0")
+        self.db.set_state("analyze_completed", "0")
+
+        if is_resume:
+            self.progress.emit(f"Analyze Duplicates: resuming after work_key={last_key[:60]}")
+        else:
+            self.db.set_state("analyze_last_work_key", "")
+            last_key = ""
+            self.db.execute("DELETE FROM deletion_queue")
+
         stats = {"works": 0, "works_with_dupes": 0, "queued": 0}
         self.stats.emit(stats.copy())
 
@@ -368,7 +382,7 @@ class AnalyzeWorker(QObject):
             raise
 
         if self._stop:
-            return False, "Analyze Duplicates aborted (progress saved)."
+            return False, "Analyze Duplicates aborted (progress saved for resume)."
         self.db.set_state("analyze_completed", "1")
         self.db.set_state("analyze_duplicates_completed", "1")
         return True, "Analyze Duplicates completed."
