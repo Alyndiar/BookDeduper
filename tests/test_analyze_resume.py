@@ -75,6 +75,24 @@ class AnalyzeResumeTests(unittest.TestCase):
         self.assertEqual(len(rows_a), 2)
         self.assertEqual(len(rows_b), 2)
 
+    def test_duplicates_resume_keeps_existing_queue_extreme_plus(self):
+        db = self._make_db("extreme+")
+        self._seed_duplicate_data(db)
+        db.execute("INSERT INTO deletion_queue(work_key,file_id,checked,reason,created_at) VALUES(?,?,?,?,?)", ("a", 1, 0, "KEEP (best)", 1))
+        db.execute("INSERT INTO deletion_queue(work_key,file_id,checked,reason,created_at) VALUES(?,?,?,?,?)", ("a", 2, 1, "Lower rank", 1))
+        db.set_state("analyze_last_work_key", "a")
+        db.set_state("analyze_duplicates_completed", "0")
+
+        worker = AnalyzeWorker(db, phase="duplicates", commit_every=100)
+        ok, _msg = worker._run_analyze_duplicates()
+        self.assertTrue(ok)
+
+        rows_a = db.query_all("SELECT 1 FROM deletion_queue WHERE work_key='a'")
+        rows_b = db.query_all("SELECT 1 FROM deletion_queue WHERE work_key='b'")
+        self.assertEqual(len(rows_a), 2)
+        self.assertEqual(len(rows_b), 2)
+
+
 
 if __name__ == "__main__":
     unittest.main()

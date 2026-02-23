@@ -11,6 +11,8 @@ class ScanTab(QWidget):
             return {"commit_every": 2500, "checkpoint_every_s": 1.0}
         if p == "extreme":
             return {"commit_every": 20000, "checkpoint_every_s": 4.0}
+        if p == "extreme+":
+            return {"commit_every": 35000, "checkpoint_every_s": 6.0}
         return {"commit_every": 8000, "checkpoint_every_s": 2.0}
 
     def __init__(self, get_db, on_scan_completed):

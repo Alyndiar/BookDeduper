@@ -66,6 +66,8 @@ class AnalyzeWorker(QObject):
             return 3000
         if p == "extreme":
             return 50000
+        if p == "extreme+":
+            return 90000
         return 15000
 
     def _flush_author_deltas(self, known_delta: Dict[str, Dict[str, object]], variant_delta: Dict[Tuple[str, str], int], ts: int):
@@ -252,6 +254,8 @@ class AnalyzeWorker(QObject):
             return 5000
         if p == "extreme":
             return 50000
+        if p == "extreme+":
+            return 90000
         return 15000
 
     def _flush_duplicate_queue_chunk(self, queue_rows: List[Tuple[str, int, int, str, int]]):
@@ -286,8 +290,8 @@ class AnalyzeWorker(QObject):
         self.stats.emit(stats.copy())
 
         memory_profile = (self.db.get_state("memory_profile", "balanced") or "balanced").lower()
-        in_memory_queue = [] if memory_profile == "extreme" else None
-        grouped_rows = self._load_duplicate_rows_in_memory(last_key) if memory_profile == "extreme" else None
+        in_memory_queue = [] if memory_profile in ("extreme", "extreme+") else None
+        grouped_rows = self._load_duplicate_rows_in_memory(last_key) if memory_profile in ("extreme", "extreme+") else None
         flush_chunk = self._duplicates_flush_chunk()
 
         if grouped_rows is not None:

@@ -25,6 +25,12 @@ MEMORY_PROFILES = {
         "wal_autocheckpoint": 20000,
         "synchronous": "NORMAL",
     },
+    "extreme+": {
+        "cache_size": -4194304,     # 4 GiB
+        "mmap_size": 8589934592,    # 8 GiB
+        "wal_autocheckpoint": 40000,
+        "synchronous": "NORMAL",
+    },
 }
 
 SCHEMA = r"""

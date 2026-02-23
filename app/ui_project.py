@@ -62,7 +62,7 @@ class ProjectTab(QWidget):
         mrow = QHBoxLayout()
         mrow.addWidget(QLabel("Memory profile:"))
         self.cmb_memory_profile = QComboBox()
-        self.cmb_memory_profile.addItems(["safe", "balanced", "extreme"])
+        self.cmb_memory_profile.addItems(["safe", "balanced", "extreme", "extreme+"])
         self.cmb_memory_profile.currentTextChanged.connect(self.save_settings_if_open)
         mrow.addWidget(self.cmb_memory_profile)
         lay.addLayout(mrow)
