@@ -1,7 +1,6 @@
 from __future__ import annotations
 import time
 import logging
-import os
 from typing import Dict, List, Tuple
 from PySide6.QtCore import QObject, Signal
 from .db import DB
@@ -49,7 +48,6 @@ class AnalyzeWorker(QObject):
         except Exception as e:
             self.finished.emit(False, f"Analyze error: {e!r}")
 
-
     def _maybe_backup_before_phase(self, phase: str):
         enabled = (self.db.get_state("backup_before_analyze", "1") == "1")
         if not enabled:
@@ -61,71 +59,134 @@ class AnalyzeWorker(QObject):
         rows = self.db.query_all("SELECT normalized_name FROM invalid_authors")
         return {str(r["normalized_name"] or "").strip() for r in rows if str(r["normalized_name"] or "").strip()}
 
-    def _rebuild_known_authors(self):
-        invalid_set = self._load_invalid_set()
-        files = self.db.query_all("SELECT id,name FROM files")
-        temp_counts: Dict[str, Dict[str, object]] = {}
+    def _authors_chunk_size(self) -> int:
+        p = (self.db.get_state("memory_profile", "balanced") or "balanced").lower()
+        if p == "safe":
+            return 3000
+        if p == "extreme":
+            return 50000
+        return 15000
 
-        for i, r in enumerate(files, start=1):
-            if self._stop:
-                break
-            self._maybe_pause()
-            if i % 500 == 0:
-                self.progress.emit(f"Analyze Authors: {i}/{len(files)}")
-            parsed = parse_filename(str(r["name"] or ""), invalid_authors=invalid_set)
-            if parsed.author_confidence < 0.70:
-                continue
-            if not parsed.author_norm or parsed.author_norm in invalid_set or parsed.author_norm == "unknown":
-                continue
-            row = temp_counts.get(parsed.author_norm)
-            if not row:
-                temp_counts[parsed.author_norm] = {"canonical": parsed.author, "frequency": 1}
-            else:
-                row["frequency"] = int(row["frequency"]) + 1
-                if len(parsed.author) > len(str(row["canonical"])):
-                    row["canonical"] = parsed.author
-
-        ts = now_ts()
-        self.db.execute("DELETE FROM known_authors")
-        self.db.execute("DELETE FROM author_variants")
+    def _flush_author_deltas(self, known_delta: Dict[str, Dict[str, object]], variant_delta: Dict[Tuple[str, str], int], ts: int):
+        if not known_delta and not variant_delta:
+            return
         known_rows = []
-        variant_rows = []
-        for norm, info in temp_counts.items():
-            canonical = str(info["canonical"])
-            freq = int(info["frequency"])
-            known_rows.append((norm, canonical, freq, ts, ts))
-            variant_rows.append((norm, canonical, freq, ts))
+        for norm, info in known_delta.items():
+            known_rows.append((norm, str(info["canonical"]), int(info["frequency"]), ts, ts))
         if known_rows:
             self.db.executemany(
-                "INSERT INTO known_authors(normalized_name,canonical_name,frequency,created_at,updated_at) VALUES(?,?,?,?,?)",
+                """
+                INSERT INTO known_authors(normalized_name,canonical_name,frequency,created_at,updated_at)
+                VALUES(?,?,?,?,?)
+                ON CONFLICT(normalized_name) DO UPDATE SET
+                  canonical_name=CASE WHEN length(excluded.canonical_name) > length(known_authors.canonical_name)
+                    THEN excluded.canonical_name ELSE known_authors.canonical_name END,
+                  frequency=known_authors.frequency + excluded.frequency,
+                  updated_at=excluded.updated_at
+                """,
                 known_rows,
             )
+
+        variant_rows = []
+        for (norm, variant), freq in variant_delta.items():
+            variant_rows.append((norm, variant, int(freq), ts))
         if variant_rows:
             self.db.executemany(
-                "INSERT INTO author_variants(normalized_name,variant_text,frequency,updated_at) VALUES(?,?,?,?)",
+                """
+                INSERT INTO author_variants(normalized_name,variant_text,frequency,updated_at)
+                VALUES(?,?,?,?)
+                ON CONFLICT(normalized_name,variant_text) DO UPDATE SET
+                  frequency=author_variants.frequency + excluded.frequency,
+                  updated_at=excluded.updated_at
+                """,
                 variant_rows,
             )
-
-        known_for_suggest = [(k, str(v["canonical"]), int(v["frequency"])) for k, v in temp_counts.items()]
-        suggestions = build_merge_suggestions(known_for_suggest)
-        logger.debug("author_db_rebuilt authors=%s suggestions=%s", len(temp_counts), len(suggestions))
 
     def _run_analyze_authors(self) -> Tuple[bool, str]:
         if self.db.get_state("scan_completed", "0") != "1":
             return False, "Scan must complete before Analyze Authors."
-        self.db.begin()
-        try:
-            self._rebuild_known_authors()
+
+        invalid_set = self._load_invalid_set()
+        dirty = (self.db.get_state("author_db_dirty", "0") == "1")
+        last_id = int(self.db.get_state("analyze_authors_last_file_id", "0") or "0")
+
+        if dirty:
+            self.db.begin()
+            try:
+                self.db.execute("DELETE FROM known_authors")
+                self.db.execute("DELETE FROM author_variants")
+                self.db.set_state("analyze_authors_last_file_id", "0")
+                self.db.set_state("analyze_authors_completed", "0")
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                raise
+            last_id = 0
+
+        files = self.db.query_all("SELECT id,name FROM files WHERE id > ? ORDER BY id", (last_id,))
+        if not files:
             self.db.set_state("analyze_authors_completed", "1")
             self.db.set_state("author_db_dirty", "0")
+            return True, "Analyze Authors completed (no pending files)."
+
+        chunk_size = self._authors_chunk_size()
+        known_delta: Dict[str, Dict[str, object]] = {}
+        variant_delta: Dict[Tuple[str, str], int] = {}
+        processed = 0
+        ts = now_ts()
+
+        self.db.begin()
+        try:
+            for r in files:
+                if self._stop:
+                    break
+                self._maybe_pause()
+                fid = int(r["id"])
+                parsed = parse_filename(str(r["name"] or ""), invalid_authors=invalid_set)
+                if parsed.author_confidence >= 0.70 and parsed.author_norm and parsed.author_norm not in invalid_set and parsed.author_norm != "unknown":
+                    rec = known_delta.get(parsed.author_norm)
+                    if not rec:
+                        known_delta[parsed.author_norm] = {"canonical": parsed.author, "frequency": 1}
+                    else:
+                        rec["frequency"] = int(rec["frequency"]) + 1
+                        if len(parsed.author) > len(str(rec["canonical"])):
+                            rec["canonical"] = parsed.author
+                    k = (parsed.author_norm, parsed.author)
+                    variant_delta[k] = int(variant_delta.get(k, 0)) + 1
+
+                processed += 1
+                if processed % 500 == 0:
+                    self.progress.emit(f"Analyze Authors: +{processed} (last_file_id={fid})")
+
+                if processed % chunk_size == 0:
+                    ts = now_ts()
+                    self._flush_author_deltas(known_delta, variant_delta, ts)
+                    known_delta.clear()
+                    variant_delta.clear()
+                    self.db.set_state("analyze_authors_last_file_id", str(fid))
+                    self.db.commit()
+                    self.db.begin()
+
+            ts = now_ts()
+            self._flush_author_deltas(known_delta, variant_delta, ts)
+            if files:
+                final_id = int(files[min(processed, len(files)) - 1]["id"]) if processed > 0 else last_id
+                self.db.set_state("analyze_authors_last_file_id", str(final_id))
             self.db.commit()
         except Exception:
             self.db.rollback()
             raise
-        if self._stop:
-            return False, "Analyze Authors aborted."
-        return True, "Analyze Authors completed."
 
+        # recompute suggestions from persisted known_authors only when completed
+        if not self._stop:
+            rows = self.db.query_all("SELECT normalized_name, canonical_name, frequency FROM known_authors")
+            suggestions = build_merge_suggestions([(str(r["normalized_name"]), str(r["canonical_name"]), int(r["frequency"] or 0)) for r in rows])
+            logger.debug("author_db_rebuilt authors=%s suggestions=%s", len(rows), len(suggestions))
+            self.db.set_state("analyze_authors_completed", "1")
+            self.db.set_state("author_db_dirty", "0")
+            return True, "Analyze Authors completed."
+
+        return False, "Analyze Authors aborted (progress saved)."
 
     def _load_duplicate_rows_in_memory(self, last_key: str) -> Dict[str, List[dict]]:
         if last_key:
@@ -154,6 +215,22 @@ class AnalyzeWorker(QObject):
             grouped.setdefault(wk, []).append(dict(r))
         return grouped
 
+    def _duplicates_flush_chunk(self) -> int:
+        p = (self.db.get_state("memory_profile", "balanced") or "balanced").lower()
+        if p == "safe":
+            return 5000
+        if p == "extreme":
+            return 50000
+        return 15000
+
+    def _flush_duplicate_queue_chunk(self, queue_rows: List[Tuple[str, int, int, str, int]]):
+        if not queue_rows:
+            return
+        self.db.executemany(
+            "INSERT INTO deletion_queue(work_key,file_id,checked,reason,created_at) VALUES(?,?,?,?,?)",
+            queue_rows,
+        )
+
     def _run_analyze_duplicates(self) -> Tuple[bool, str]:
         if self.db.get_state("scan_completed", "0") != "1":
             return False, "Scan must complete before Analyze Duplicates."
@@ -168,6 +245,7 @@ class AnalyzeWorker(QObject):
         memory_profile = (self.db.get_state("memory_profile", "balanced") or "balanced").lower()
         in_memory_queue = [] if memory_profile == "extreme" else None
         grouped_rows = self._load_duplicate_rows_in_memory(last_key) if memory_profile == "extreme" else None
+        flush_chunk = self._duplicates_flush_chunk()
 
         if grouped_rows is not None:
             works = [{"work_key": wk} for wk in grouped_rows.keys()]
@@ -241,23 +319,27 @@ class AnalyzeWorker(QObject):
 
                 self.db.set_state("analyze_last_work_key", work_key)
 
+                # chunk-flush to reduce loss window while keeping low I/O
+                if in_memory_queue is not None and len(in_memory_queue) >= flush_chunk:
+                    self._flush_duplicate_queue_chunk(in_memory_queue)
+                    in_memory_queue.clear()
+                    self.db.commit()
+                    self.db.begin()
+
                 if in_memory_queue is None and changed >= self.commit_every:
                     self.db.commit()
                     self.db.begin()
                     changed = 0
 
             if in_memory_queue is not None and in_memory_queue:
-                self.db.executemany(
-                    "INSERT INTO deletion_queue(work_key,file_id,checked,reason,created_at) VALUES(?,?,?,?,?)",
-                    in_memory_queue,
-                )
+                self._flush_duplicate_queue_chunk(in_memory_queue)
             self.db.commit()
         except Exception:
             self.db.rollback()
             raise
 
         if self._stop:
-            return False, "Analyze Duplicates aborted."
+            return False, "Analyze Duplicates aborted (progress saved)."
         self.db.set_state("analyze_completed", "1")
         self.db.set_state("analyze_duplicates_completed", "1")
         return True, "Analyze Duplicates completed."
