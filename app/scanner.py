@@ -297,9 +297,11 @@ class ScanWorker(QObject):
 
                 try:
                     existing_by_path = self._folder_file_index(current_dir)
+                    dir_interrupted = False
                     with os.scandir(current_dir) as it:
                         for entry in it:
                             if self._stop:
+                                dir_interrupted = True
                                 break
                             self._maybe_pause()
 
@@ -449,6 +451,13 @@ class ScanWorker(QObject):
                 except Exception:
                     continue
 
+                if dir_interrupted and current_dir:
+                    # Preserve exact resumability: re-queue the in-progress folder so a
+                    # stop/reload resumes this directory rather than skipping remaining files.
+                    if current_dir not in stack:
+                        stack.append(current_dir)
+                    last_path = current_dir
+
             self.db.commit()
 
         except Exception:
@@ -457,8 +466,9 @@ class ScanWorker(QObject):
 
         if self._stop:
             self._set_scan_status(scan_id, "aborted")
+            self.progress.emit(f"Scan paused/stopped; checkpoint saved at folder: {current_dir}")
             self._save_checkpoint(scan_id, stack, current_dir, last_path, stats)
-            return False, "Scan aborted."
+            return False, "Scan aborted (progress saved for resume)."
         else:
             self._set_scan_status(scan_id, "completed")
             self._save_checkpoint(scan_id, [], "", "", stats)
