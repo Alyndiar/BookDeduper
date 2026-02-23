@@ -1,6 +1,6 @@
 from __future__ import annotations
 from PySide6.QtCore import QThread
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QTextEdit, QMessageBox
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QTextEdit, QMessageBox, QProgressBar
 from .analyzer import AnalyzeWorker
 
 class AnalyzeTab(QWidget):
@@ -21,6 +21,12 @@ class AnalyzeTab(QWidget):
         lay = QVBoxLayout(self)
         self.status = QLabel("Analyze status: idle")
         lay.addWidget(self.status)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 10000)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("0.00%")
+        lay.addWidget(self.progress_bar)
 
         self.log = QTextEdit()
         self.log.setReadOnly(True)
@@ -91,6 +97,7 @@ class AnalyzeTab(QWidget):
 
         self.thread.started.connect(self.worker.run)
         self.worker.progress.connect(self.on_progress)
+        self.worker.progress_percent.connect(self.on_progress_percent)
         self.worker.stats.connect(self.on_stats)
         self.worker.finished.connect(self.on_finished)
 
@@ -100,6 +107,8 @@ class AnalyzeTab(QWidget):
         self.btn_stop.setEnabled(True)
         self.btn_resume.setEnabled(False)
 
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("0.00%")
         self.append(f"=== {phase} started ===")
         self.thread.start()
 
@@ -126,6 +135,13 @@ class AnalyzeTab(QWidget):
         self.status.setText(f"Analyze: {msg}")
         self.append(msg)
 
+    def on_progress_percent(self, pct: float, stage: str):
+        if stage != "authors_suggestions":
+            return
+        pct = max(0.0, min(100.0, float(pct)))
+        self.progress_bar.setValue(int(round(pct * 100)))
+        self.progress_bar.setFormat(f"{pct:.2f}%")
+
     def on_stats(self, st: dict):
         self.status.setText(
             f"Analyze: works={st.get('works')} works_with_dupes={st.get('works_with_dupes')} queued={st.get('queued')}"
@@ -134,6 +150,9 @@ class AnalyzeTab(QWidget):
     def on_finished(self, ok: bool, msg: str):
         self.append(msg)
         self.status.setText(f"Analyze status: {msg}")
+        if ok and self.current_phase == "authors":
+            self.progress_bar.setValue(10000)
+            self.progress_bar.setFormat("100.00%")
 
         if self.thread:
             self.thread.quit()

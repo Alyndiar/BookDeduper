@@ -34,6 +34,23 @@ class AuthorDetectionTests(unittest.TestCase):
         p = parse_filename("Complete Collection - Volume 2 - Some Author.epub")
         self.assertEqual(p.author, "Some Author")
 
+    def test_merge_suggestions_progress_callback(self):
+        known = [
+            ("isaac asimov", "Isaac Asimov", 100),
+            ("asimov isaac", "Asimov, Isaac", 10),
+            ("i asimov", "I. Asimov", 5),
+        ]
+        events = []
+
+        def cb(done, total):
+            events.append((done, total))
+
+        build_merge_suggestions(known, threshold=0.50, progress_cb=cb, progress_every=1)
+        self.assertTrue(events)
+        self.assertEqual(events[0][0], 0)
+        self.assertEqual(events[-1][0], events[-1][1])
+        self.assertEqual(events[-1][1], 3)
+
     def test_merge_suggestions(self):
         known = [
             ("isaac asimov", "Isaac Asimov", 100),

@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 class AnalyzeWorker(QObject):
     progress = Signal(str)
+    progress_percent = Signal(float, str)
     stats = Signal(dict)
     finished = Signal(bool, str)
 
@@ -106,6 +107,7 @@ class AnalyzeWorker(QObject):
         if self.db.get_state("scan_completed", "0") != "1":
             return False, "Scan must complete before Analyze Authors."
 
+        self.progress_percent.emit(0.0, "authors_suggestions")
         invalid_set = self._load_invalid_set()
         dirty = (self.db.get_state("author_db_dirty", "0") == "1")
         last_id = int(self.db.get_state("analyze_authors_last_file_id", "0") or "0")
@@ -179,31 +181,36 @@ class AnalyzeWorker(QObject):
             raise
 
         # recompute suggestions from persisted known_authors only when completed.
-        # For very large libraries this can be O(n²), so keep Analyze Authors responsive
-        # by bounding pairwise suggestion generation.
+        # This step is O(n²); emit percentage progress so long runs remain observable.
         if not self._stop:
             rows = self.db.query_all("SELECT normalized_name, canonical_name, frequency FROM known_authors")
             author_count = len(rows)
-            suggestion_limit = 7000
-            suggestions_count = 0
-            if author_count <= suggestion_limit:
-                self.progress.emit("Analyze Authors: finalizing merge suggestions…")
+            self.progress.emit(f"Analyze Authors: finalizing merge suggestions for {author_count} authors…")
+
+            def _on_pair_progress(done: int, total: int):
+                if total <= 0:
+                    pct = 100.0
+                else:
+                    pct = (done * 100.0) / total
+                self.progress_percent.emit(pct, "authors_suggestions")
+                # Emit readable milestones without flooding the log panel.
+                if done == 0 or done == total or (done % 250000 == 0):
+                    self.progress.emit(f"Analyze Authors: merge suggestions {pct:.2f}% ({done}/{total} pairs)")
+                self._maybe_pause()
+                if self._stop:
+                    raise InterruptedError("Analyze Authors stopped during merge suggestion pass")
+
+            try:
                 suggestions = build_merge_suggestions([
                     (str(r["normalized_name"]), str(r["canonical_name"]), int(r["frequency"] or 0))
                     for r in rows
-                ])
+                ], progress_cb=_on_pair_progress)
                 suggestions_count = len(suggestions)
-            else:
-                self.progress.emit(
-                    f"Analyze Authors: skipping merge suggestion pass for {author_count} authors (limit={suggestion_limit})"
-                )
-                logger.debug(
-                    "author_merge_suggestions_skipped authors=%s limit=%s",
-                    author_count,
-                    suggestion_limit,
-                )
+            except InterruptedError:
+                return False, "Analyze Authors aborted (progress saved)."
 
             logger.debug("author_db_rebuilt authors=%s suggestions=%s", author_count, suggestions_count)
+            self.progress_percent.emit(100.0, "authors_suggestions")
             self.db.set_state("analyze_authors_completed", "1")
             self.db.set_state("author_db_dirty", "0")
             return True, "Analyze Authors completed."

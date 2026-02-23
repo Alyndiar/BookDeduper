@@ -5,7 +5,7 @@ import unicodedata
 import logging
 from dataclasses import dataclass
 from difflib import SequenceMatcher
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Optional, Tuple, List, Dict, Any, Callable
 from .util import normalize_text
 
 logger = logging.getLogger(__name__)
@@ -374,12 +374,20 @@ def _punctuation_only_variant(a: str, b: str) -> bool:
 def build_merge_suggestions(
     known_authors: List[Tuple[str, str, int]],
     threshold: float = 0.92,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+    progress_every: int = 50000,
 ) -> List[MergeSuggestion]:
     suggestions: List[MergeSuggestion] = []
+    total_pairs = (len(known_authors) * (len(known_authors) - 1)) // 2
+    checked_pairs = 0
+    if progress_cb:
+        progress_cb(0, total_pairs)
+
     for i in range(len(known_authors)):
         ln, ld, _lf = known_authors[i]
         for j in range(i + 1, len(known_authors)):
             rn, rd, _rf = known_authors[j]
+            checked_pairs += 1
             jacc = _token_jaccard(ln, rn)
             seq = SequenceMatcher(None, ln, rn).ratio()
             sim = 0.62 * jacc + 0.38 * seq
@@ -391,10 +399,17 @@ def build_merge_suggestions(
                 reason = "comma-order variant"
             elif _punctuation_only_variant(ld, rd):
                 reason = "punctuation-only difference"
-            if sim < threshold:
-                continue
-            auto_merge_safe = sim >= 0.98 and _punctuation_only_variant(ld, rd)
-            suggestions.append(MergeSuggestion(ld, rd, sim, reason, auto_merge_safe))
+            if sim >= threshold:
+                auto_merge_safe = sim >= 0.98 and _punctuation_only_variant(ld, rd)
+                suggestions.append(MergeSuggestion(ld, rd, sim, reason, auto_merge_safe))
+
+            if progress_cb and (
+                checked_pairs == total_pairs
+                or checked_pairs == 1
+                or checked_pairs % max(int(progress_every), 1) == 0
+            ):
+                progress_cb(checked_pairs, total_pairs)
+
     suggestions.sort(key=lambda s: (s.similarity, s.left_name, s.right_name), reverse=True)
-    logger.debug("merge_suggestions count=%s", len(suggestions))
+    logger.debug("merge_suggestions count=%s total_pairs=%s", len(suggestions), total_pairs)
     return suggestions
