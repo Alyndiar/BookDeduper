@@ -51,6 +51,21 @@ class AuthorDetectionTests(unittest.TestCase):
         self.assertEqual(events[-1][0], events[-1][1])
         self.assertEqual(events[-1][1], 3)
 
+    def test_merge_suggestions_blocking_handles_no_candidates(self):
+        known = [
+            ("isaac asimov", "Isaac Asimov", 100),
+            ("victor hugo", "Victor Hugo", 90),
+        ]
+        events = []
+
+        def cb(done, total):
+            events.append((done, total))
+
+        suggestions = build_merge_suggestions(known, threshold=0.92, progress_cb=cb, progress_every=1)
+        self.assertEqual(suggestions, [])
+        self.assertTrue(events)
+        self.assertEqual(events[0], (0, 0))
+
     def test_merge_suggestions(self):
         known = [
             ("isaac asimov", "Isaac Asimov", 100),
