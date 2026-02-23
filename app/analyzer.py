@@ -167,6 +167,7 @@ class AnalyzeWorker(QObject):
                     self.db.commit()
                     self.db.begin()
 
+            self.progress.emit("Analyze Authors: flushing final author deltas…")
             ts = now_ts()
             self._flush_author_deltas(known_delta, variant_delta, ts)
             if files:
@@ -177,11 +178,32 @@ class AnalyzeWorker(QObject):
             self.db.rollback()
             raise
 
-        # recompute suggestions from persisted known_authors only when completed
+        # recompute suggestions from persisted known_authors only when completed.
+        # For very large libraries this can be O(n²), so keep Analyze Authors responsive
+        # by bounding pairwise suggestion generation.
         if not self._stop:
             rows = self.db.query_all("SELECT normalized_name, canonical_name, frequency FROM known_authors")
-            suggestions = build_merge_suggestions([(str(r["normalized_name"]), str(r["canonical_name"]), int(r["frequency"] or 0)) for r in rows])
-            logger.debug("author_db_rebuilt authors=%s suggestions=%s", len(rows), len(suggestions))
+            author_count = len(rows)
+            suggestion_limit = 7000
+            suggestions_count = 0
+            if author_count <= suggestion_limit:
+                self.progress.emit("Analyze Authors: finalizing merge suggestions…")
+                suggestions = build_merge_suggestions([
+                    (str(r["normalized_name"]), str(r["canonical_name"]), int(r["frequency"] or 0))
+                    for r in rows
+                ])
+                suggestions_count = len(suggestions)
+            else:
+                self.progress.emit(
+                    f"Analyze Authors: skipping merge suggestion pass for {author_count} authors (limit={suggestion_limit})"
+                )
+                logger.debug(
+                    "author_merge_suggestions_skipped authors=%s limit=%s",
+                    author_count,
+                    suggestion_limit,
+                )
+
+            logger.debug("author_db_rebuilt authors=%s suggestions=%s", author_count, suggestions_count)
             self.db.set_state("analyze_authors_completed", "1")
             self.db.set_state("author_db_dirty", "0")
             return True, "Analyze Authors completed."
