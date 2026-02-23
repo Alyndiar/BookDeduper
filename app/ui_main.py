@@ -63,16 +63,16 @@ class MainWindow(QMainWindow):
         mono.setPointSize(max(8, mono.pointSize() - 1))
         fm = QFontMetrics(mono)
 
-        self.status_label = self._make_field_label(mono, "Analyze Duplicates")
-        self.dirs_label = self._make_field_label(mono, "Dirs 999999")
-        self.files_label = self._make_field_label(mono, "Files 9999999")
-        self.authors_label = self._make_field_label(mono, "Authors 9999999")
-        self.groups_files_label = self._make_field_label(mono, "Dupes 9999999/9999999")
-        self.left_label = self._make_field_label(mono, "Left 9999999/9999999")
+        self.status_label = self._make_field_label(mono, " Analyze Duplicates ")
+        self.dirs_label = self._make_field_label(mono, " Dirs 999999 ")
+        self.files_label = self._make_field_label(mono, " Files 9999999 ")
+        self.authors_label = self._make_field_label(mono, " Authors 9999999 ")
+        self.groups_files_label = self._make_field_label(mono, " Dupes 9999999/9999999 ")
+        self.left_label = self._make_field_label(mono, " Left 9999999/9999999 ")
 
         self._set_field_texts("Idle", 0, 0, 0, 0, 0, 0, 0)
 
-        sep_w = fm.horizontalAdvance(" | ") + 4
+        sep_w = fm.horizontalAdvance("|") + 4
         self._status_required_width = (
             self.status_label.width()
             + self.dirs_label.width()
@@ -188,12 +188,12 @@ class MainWindow(QMainWindow):
         }
 
     def _set_field_texts(self, mode: str, dirs: int, files: int, authors: int, found_groups: int, found_files: int, left_groups: int, left_files: int):
-        self.status_label.setText(mode)
-        self.dirs_label.setText(f"Dirs {dirs}")
-        self.files_label.setText(f"Files {files}")
-        self.authors_label.setText(f"Authors {authors}")
-        self.groups_files_label.setText(f"Dupes {found_groups}/{found_files}")
-        self.left_label.setText(f"Left {left_groups}/{left_files}")
+        self.status_label.setText(f" {mode} ")
+        self.dirs_label.setText(f" Dirs {dirs} ")
+        self.files_label.setText(f" Files {files} ")
+        self.authors_label.setText(f" Authors {authors} ")
+        self.groups_files_label.setText(f" Dupes {found_groups}/{found_files} ")
+        self.left_label.setText(f" Left {left_groups}/{left_files} ")
 
     def refresh_all_statuses(self):
         st = self._collect_stats()
