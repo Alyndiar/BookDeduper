@@ -40,6 +40,7 @@ class AnalyzeWorker(QObject):
 
     def run(self):
         try:
+            self._maybe_backup_before_phase(self.phase)
             if self.phase == "authors":
                 ok, msg = self._run_analyze_authors()
             else:
@@ -47,6 +48,14 @@ class AnalyzeWorker(QObject):
             self.finished.emit(ok, msg)
         except Exception as e:
             self.finished.emit(False, f"Analyze error: {e!r}")
+
+
+    def _maybe_backup_before_phase(self, phase: str):
+        enabled = (self.db.get_state("backup_before_analyze", "1") == "1")
+        if not enabled:
+            return
+        path = self.db.create_timestamped_backup(label=f"analyze_{phase}")
+        logger.debug("analyze_backup_created phase=%s path=%s", phase, path)
 
     def _load_invalid_set(self) -> set[str]:
         rows = self.db.query_all("SELECT normalized_name FROM invalid_authors")
@@ -125,6 +134,9 @@ class AnalyzeWorker(QObject):
         else:
             works = self.db.query_all("SELECT work_key FROM works ORDER BY work_key")
 
+        memory_profile = (self.db.get_state("memory_profile", "balanced") or "balanced").lower()
+        in_memory_queue = [] if memory_profile == "extreme" else None
+
         self.db.begin()
         try:
             changed = 0
@@ -174,20 +186,29 @@ class AnalyzeWorker(QObject):
                     else:
                         checked = 1
                         reason = "Lower rank"
-                    self.db.execute(
-                        "INSERT INTO deletion_queue(work_key,file_id,checked,reason,created_at) VALUES(?,?,?,?,?)",
-                        (work_key, f["id"], checked, reason, created),
-                    )
+                    row = (work_key, f["id"], checked, reason, created)
+                    if in_memory_queue is not None:
+                        in_memory_queue.append(row)
+                    else:
+                        self.db.execute(
+                            "INSERT INTO deletion_queue(work_key,file_id,checked,reason,created_at) VALUES(?,?,?,?,?)",
+                            row,
+                        )
                     stats["queued"] += 1
                     changed += 1
 
                 self.db.set_state("analyze_last_work_key", work_key)
 
-                if changed >= self.commit_every:
+                if in_memory_queue is None and changed >= self.commit_every:
                     self.db.commit()
                     self.db.begin()
                     changed = 0
 
+            if in_memory_queue is not None and in_memory_queue:
+                self.db.executemany(
+                    "INSERT INTO deletion_queue(work_key,file_id,checked,reason,created_at) VALUES(?,?,?,?,?)",
+                    in_memory_queue,
+                )
             self.db.commit()
         except Exception:
             self.db.rollback()

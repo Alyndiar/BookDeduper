@@ -1,5 +1,7 @@
 from __future__ import annotations
 import sqlite3
+import os
+import time
 from typing import Iterable, Optional
 
 SCHEMA_VERSION = 4
@@ -225,6 +227,25 @@ class DB:
     def memory_profile(self) -> str:
         p = (self.get_state("memory_profile", "balanced") or "balanced").strip().lower()
         return p if p in MEMORY_PROFILES else "balanced"
+
+
+    def backup_to(self, backup_path: str):
+        parent = os.path.dirname(backup_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        dst = sqlite3.connect(backup_path)
+        try:
+            self.conn.backup(dst)
+        finally:
+            dst.close()
+
+    def create_timestamped_backup(self, label: str = "manual") -> str:
+        ts = int(time.time())
+        backup_path = f"{self.db_path}.{label}.{ts}.bak"
+        self.backup_to(backup_path)
+        self.set_state("last_backup_path", backup_path)
+        self.set_state("last_backup_ts", str(ts))
+        return backup_path
 
     def close(self):
         self.conn.close()
