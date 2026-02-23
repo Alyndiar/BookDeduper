@@ -23,6 +23,12 @@ class MainWindow(QMainWindow):
         self.db: DB | None = None
         self._io_reads = 0
         self._io_writes = 0
+        self._last_stats = {
+            "folders": 0, "files": 0, "authors": 0,
+            "dup_found_groups": 0, "dup_found_files": 0,
+            "dup_todo_groups": 0, "dup_todo_files": 0,
+        }
+        self._refreshing_status = False
 
         self.tabs = QTabWidget()
         self.tabs.setTabsClosable(False)
@@ -144,7 +150,16 @@ class MainWindow(QMainWindow):
         else:
             self._io_writes = max(0, self._io_writes + (1 if active else -1))
             self._set_io_box(self.write_box, "red" if self._io_writes > 0 else "black")
-        self.refresh_all_statuses()
+        self._set_field_texts(
+            self._current_mode(),
+            self._last_stats.get("folders", 0),
+            self._last_stats.get("files", 0),
+            self._last_stats.get("authors", 0),
+            self._last_stats.get("dup_found_groups", 0),
+            self._last_stats.get("dup_found_files", 0),
+            self._last_stats.get("dup_todo_groups", 0),
+            self._last_stats.get("dup_todo_files", 0),
+        )
 
     def _safe_i(self, row, key: str) -> int:
         if not row:
@@ -186,20 +201,32 @@ class MainWindow(QMainWindow):
         self.left_label.setText(f" Left {left_groups}/{left_files} ")
 
     def refresh_all_statuses(self):
-        st = self._collect_stats()
-        if not st:
-            self._set_field_texts(self._current_mode(), 0, 0, 0, 0, 0, 0, 0)
+        if self._refreshing_status:
             return
-        self._set_field_texts(
-            self._current_mode(),
-            st.get("folders", 0),
-            st.get("files", 0),
-            st.get("authors", 0),
-            st.get("dup_found_groups", 0),
-            st.get("dup_found_files", 0),
-            st.get("dup_todo_groups", 0),
-            st.get("dup_todo_files", 0),
-        )
+        self._refreshing_status = True
+        try:
+            st = self._collect_stats()
+            if not st:
+                self._last_stats = {
+                    "folders": 0, "files": 0, "authors": 0,
+                    "dup_found_groups": 0, "dup_found_files": 0,
+                    "dup_todo_groups": 0, "dup_todo_files": 0,
+                }
+                self._set_field_texts(self._current_mode(), 0, 0, 0, 0, 0, 0, 0)
+                return
+            self._last_stats = st
+            self._set_field_texts(
+                self._current_mode(),
+                st.get("folders", 0),
+                st.get("files", 0),
+                st.get("authors", 0),
+                st.get("dup_found_groups", 0),
+                st.get("dup_found_files", 0),
+                st.get("dup_todo_groups", 0),
+                st.get("dup_todo_files", 0),
+            )
+        finally:
+            self._refreshing_status = False
 
     def on_project_opened(self, db: DB):
         if self.db:
