@@ -67,7 +67,7 @@ class AnalyzeWorker(QObject):
         if p == "extreme":
             return 50000
         if p == "extreme+":
-            return 90000
+            return 1000000
         return 15000
 
     def _flush_author_deltas(self, known_delta: Dict[str, Dict[str, object]], variant_delta: Dict[Tuple[str, str], int], ts: int):
@@ -255,7 +255,7 @@ class AnalyzeWorker(QObject):
         if p == "extreme":
             return 50000
         if p == "extreme+":
-            return 90000
+            return 1000000
         return 15000
 
     def _flush_duplicate_queue_chunk(self, queue_rows: List[Tuple[str, int, int, str, int]]):

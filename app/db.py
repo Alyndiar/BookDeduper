@@ -26,9 +26,9 @@ MEMORY_PROFILES = {
         "synchronous": "NORMAL",
     },
     "extreme+": {
-        "cache_size": -4194304,     # 4 GiB
-        "mmap_size": 8589934592,    # 8 GiB
-        "wal_autocheckpoint": 40000,
+        "cache_size": -8388608,      # 8 GiB
+        "mmap_size": 17179869184,    # 16 GiB
+        "wal_autocheckpoint": 120000,
         "synchronous": "NORMAL",
     },
 }

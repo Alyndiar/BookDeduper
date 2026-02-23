@@ -11,7 +11,7 @@ class AnalyzeTab(QWidget):
         if p == "extreme":
             return 12000
         if p == "extreme+":
-            return 20000
+            return 100000
         return 5000
 
     def __init__(self, get_db, on_analyze_completed):
