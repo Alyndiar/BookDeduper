@@ -14,11 +14,12 @@ class AnalyzeTab(QWidget):
             return 100000
         return 5000
 
-    def __init__(self, get_db, on_analyze_completed):
+    def __init__(self, get_db, on_analyze_completed, on_activity_progress=None):
         super().__init__()
         self.get_db = get_db
         self.on_analyze_completed = on_analyze_completed
         self.current_phase = "duplicates"
+        self.on_activity_progress = on_activity_progress
 
         lay = QVBoxLayout(self)
         self.status = QLabel("Analyze status: idle")
@@ -114,6 +115,8 @@ class AnalyzeTab(QWidget):
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("0.00%")
         self.append(f"=== {phase} started ===")
+        if self.on_activity_progress:
+            self.on_activity_progress("Analyze Authors" if phase == "authors" else "Analyze Duplicates", 0.0)
         self.thread.start()
 
     def pause(self):
@@ -145,6 +148,8 @@ class AnalyzeTab(QWidget):
         pct = max(0.0, min(100.0, float(pct)))
         self.progress_bar.setValue(int(round(pct * 100)))
         self.progress_bar.setFormat(f"{pct:.2f}%")
+        if self.on_activity_progress:
+            self.on_activity_progress("Analyze Authors", pct)
 
     def on_stats(self, st: dict):
         self.status.setText(
@@ -170,4 +175,6 @@ class AnalyzeTab(QWidget):
         self.btn_resume.setEnabled(False)
         self.btn_stop.setEnabled(False)
 
+        if self.on_activity_progress:
+            self.on_activity_progress("Idle", -1.0)
         self.on_analyze_completed(ok)

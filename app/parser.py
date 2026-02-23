@@ -136,7 +136,7 @@ def _is_name_like(text: str) -> Tuple[bool, float, List[str]]:
     norm = normalize_text(cleaned)
     tokens = [t for t in norm.split() if t]
     reasons: List[str] = []
-    if not (1 <= len(tokens) <= 5):
+    if not (2 <= len(tokens) <= 5):
         reasons.append("token_count")
     score = 0.5
 
@@ -171,7 +171,7 @@ def _is_name_like(text: str) -> Tuple[bool, float, List[str]]:
         if len(t) > 1 and t[0].isalpha():
             score += 0.02
 
-    valid = score >= 0.25 and len(tokens) > 0
+    valid = score >= 0.25 and len(tokens) >= 2
     return valid, max(0.0, min(score, 1.0)), reasons
 
 

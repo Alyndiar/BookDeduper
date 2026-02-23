@@ -15,6 +15,8 @@ class AuthorsTab(QWidget):
         row = QHBoxLayout()
         self.valid_list = QListWidget()
         self.invalid_list = QListWidget()
+        self.valid_list.setSelectionMode(QListWidget.ExtendedSelection)
+        self.invalid_list.setSelectionMode(QListWidget.ExtendedSelection)
         row.addWidget(self.valid_list, 1)
         row.addWidget(self.invalid_list, 1)
         lay.addLayout(row, 1)
@@ -39,11 +41,13 @@ class AuthorsTab(QWidget):
         lay.addLayout(btns)
 
 
-    def _selected_norm(self, list_widget: QListWidget):
-        item = list_widget.currentItem()
-        if not item:
-            return None
-        return str(item.data(256) or "")
+    def _selected_norms(self, list_widget: QListWidget):
+        out = []
+        for item in list_widget.selectedItems():
+            norm = str(item.data(256) or "").strip()
+            if norm:
+                out.append(norm)
+        return out
 
 
     def refresh(self):
@@ -68,19 +72,20 @@ class AuthorsTab(QWidget):
         db = self.get_db()
         if not db:
             return
-        norm = self._selected_norm(self.valid_list)
-        if not norm:
-            return
-        row = db.query_one("SELECT canonical_name FROM known_authors WHERE normalized_name=?", (norm,))
-        if not row:
+        norms = self._selected_norms(self.valid_list)
+        if not norms:
             return
         db.begin()
         try:
-            db.execute(
-                "INSERT INTO invalid_authors(normalized_name,canonical_name,reason,updated_at) VALUES(?,?,?,strftime('%s','now')) ON CONFLICT(normalized_name) DO UPDATE SET canonical_name=excluded.canonical_name, updated_at=excluded.updated_at",
-                (norm, row["canonical_name"], "manual"),
-            )
-            db.execute("DELETE FROM known_authors WHERE normalized_name=?", (norm,))
+            for norm in norms:
+                row = db.query_one("SELECT canonical_name FROM known_authors WHERE normalized_name=?", (norm,))
+                if not row:
+                    continue
+                db.execute(
+                    "INSERT INTO invalid_authors(normalized_name,canonical_name,reason,updated_at) VALUES(?,?,?,strftime('%s','now')) ON CONFLICT(normalized_name) DO UPDATE SET canonical_name=excluded.canonical_name, updated_at=excluded.updated_at",
+                    (norm, row["canonical_name"], "manual"),
+                )
+                db.execute("DELETE FROM known_authors WHERE normalized_name=?", (norm,))
             db.commit()
         except Exception as e:
             db.rollback()
@@ -92,18 +97,34 @@ class AuthorsTab(QWidget):
         db = self.get_db()
         if not db:
             return
-        norm = self._selected_norm(self.invalid_list)
-        if not norm:
+        norms = self._selected_norms(self.invalid_list)
+        if not norms:
             return
-        db.execute("DELETE FROM invalid_authors WHERE normalized_name=?", (norm,))
+        db.begin()
+        try:
+            for norm in norms:
+                db.execute("DELETE FROM invalid_authors WHERE normalized_name=?", (norm,))
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            QMessageBox.critical(self, "Authors", f"Failed: {e!r}")
+            return
         self.refresh()
 
     def delete_invalid(self):
         db = self.get_db()
         if not db:
             return
-        norm = self._selected_norm(self.invalid_list)
-        if not norm:
+        norms = self._selected_norms(self.invalid_list)
+        if not norms:
             return
-        db.execute("DELETE FROM invalid_authors WHERE normalized_name=?", (norm,))
+        db.begin()
+        try:
+            for norm in norms:
+                db.execute("DELETE FROM invalid_authors WHERE normalized_name=?", (norm,))
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            QMessageBox.critical(self, "Authors", f"Failed: {e!r}")
+            return
         self.refresh()

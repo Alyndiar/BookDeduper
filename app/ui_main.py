@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Signal
 from PySide6.QtGui import QCloseEvent, QFontDatabase, QFontMetrics
-from PySide6.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QTabWidget, QLabel, QStatusBar
+from PySide6.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QTabWidget, QLabel, QStatusBar, QProgressBar
 
 from .db import DB
 from .ui_project import ProjectTab
@@ -32,9 +32,9 @@ class MainWindow(QMainWindow):
 
         self.tabs = QTabWidget()
         self.tabs.setTabsClosable(False)
-        self.tabs.currentChanged.connect(self._on_tab_changed)
-
-        self.project_tab = ProjectTab(on_project_opened=self.on_project_opened)
+        self.project_tab = ProjectTab(on_project_opened=self.on_project_opened, on_activity_progress=self.on_activity_progress)
+        self.scan_tab = ScanTab(get_db=lambda: self.db, on_scan_completed=self.on_scan_completed, on_activity_progress=self.on_activity_progress)
+        self.analyze_tab = AnalyzeTab(get_db=lambda: self.db, on_analyze_completed=self.on_analyze_completed, on_activity_progress=self.on_activity_progress)
         self.roots_tab = RootsTab(get_db=lambda: self.db)
         self.scan_tab = ScanTab(get_db=lambda: self.db, on_scan_completed=self.on_scan_completed)
         self.analyze_tab = AnalyzeTab(get_db=lambda: self.db, on_analyze_completed=self.on_analyze_completed)
@@ -95,6 +95,13 @@ class MainWindow(QMainWindow):
         self.status.addWidget(self.groups_files_label)
         self.status.addWidget(self.left_label, 1)
 
+        self.activity_progress = QProgressBar()
+        self.activity_progress.setFixedWidth(180)
+        self.activity_progress.setRange(0, 100)
+        self.activity_progress.setValue(0)
+        self.activity_progress.setFormat("")
+        self.status.addPermanentWidget(self.activity_progress)
+
         self.read_box = self._make_io_box("R", mono)
         self.write_box = self._make_io_box("W", mono)
         self.status.addPermanentWidget(self.read_box)
@@ -150,6 +157,14 @@ class MainWindow(QMainWindow):
         else:
             self._io_writes = max(0, self._io_writes + (1 if active else -1))
             self._set_io_box(self.write_box, "red" if self._io_writes > 0 else "black")
+
+        if (self._io_reads + self._io_writes) > 0 and self.activity_progress.value() == 0:
+            self.activity_progress.setRange(0, 0)
+        elif (self._io_reads + self._io_writes) == 0 and self.activity_progress.maximum() == 0:
+            self.activity_progress.setRange(0, 100)
+            self.activity_progress.setValue(0)
+            self.activity_progress.setFormat("")
+
         self._set_field_texts(
             self._current_mode(),
             self._last_stats.get("folders", 0),
@@ -227,6 +242,23 @@ class MainWindow(QMainWindow):
             )
         finally:
             self._refreshing_status = False
+
+
+    def on_activity_progress(self, text: str, pct: float = -1.0):
+        # Generic status-bar progress channel for long operations (DB open/save/analyze/scan).
+        if pct < 0:
+            self.activity_progress.setRange(0, 100)
+            self.activity_progress.setValue(0)
+            self.activity_progress.setFormat("")
+            return
+        if pct > 100:
+            pct = 100
+        if pct < 0:
+            pct = 0
+        self.status_label.setText(f" {text} ")
+        self.activity_progress.setRange(0, 100)
+        self.activity_progress.setValue(int(pct))
+        self.activity_progress.setFormat(f"{pct:.0f}%")
 
     def on_project_opened(self, db: DB):
         if self.db:

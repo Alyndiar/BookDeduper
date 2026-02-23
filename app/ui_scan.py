@@ -15,10 +15,11 @@ class ScanTab(QWidget):
             return {"commit_every": 200000, "checkpoint_every_s": 12.0}
         return {"commit_every": 8000, "checkpoint_every_s": 2.0}
 
-    def __init__(self, get_db, on_scan_completed):
+    def __init__(self, get_db, on_scan_completed, on_activity_progress=None):
         super().__init__()
         self.get_db = get_db
         self.on_scan_completed = on_scan_completed
+        self.on_activity_progress = on_activity_progress
 
         lay = QVBoxLayout(self)
 
@@ -108,6 +109,8 @@ class ScanTab(QWidget):
         self.btn_resume.setEnabled(False)
 
         self.append("=== Scan started/resumed ===")
+        if self.on_activity_progress:
+            self.on_activity_progress("Scanning", 0.0)
         self.thread.start()
 
     def pause(self):
@@ -132,6 +135,8 @@ class ScanTab(QWidget):
     def on_progress(self, msg: str):
         self.status.setText(f"Scan status: {msg}")
         self.append(msg)
+        if self.on_activity_progress:
+            self.on_activity_progress("Scanning", 0.0)
 
     def on_stats(self, st: dict):
         self.status.setText(
@@ -155,4 +160,6 @@ class ScanTab(QWidget):
         self.btn_resume.setEnabled(False)
         self.btn_stop.setEnabled(False)
 
+        if self.on_activity_progress:
+            self.on_activity_progress("Idle", -1.0)
         self.on_scan_completed(ok)
