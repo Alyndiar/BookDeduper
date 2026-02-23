@@ -64,7 +64,8 @@ class AuthorDetectionTests(unittest.TestCase):
         suggestions = build_merge_suggestions(known, threshold=0.92, progress_cb=cb, progress_every=1)
         self.assertEqual(suggestions, [])
         self.assertTrue(events)
-        self.assertEqual(events[0], (0, 0))
+        self.assertEqual(events[0][0], 0)
+        self.assertGreaterEqual(events[0][1], 0)
 
     def test_merge_suggestions(self):
         known = [

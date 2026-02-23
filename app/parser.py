@@ -380,10 +380,131 @@ def build_merge_suggestions(
     progress_interval_s: float = 10.0,
 ) -> List[MergeSuggestion]:
     suggestions: List[MergeSuggestion] = []
-    if len(known_authors) < 2:
+    n = len(known_authors)
+    if n < 2:
         if progress_cb:
             progress_cb(0, 0)
         return suggestions
+
+    # Keep progress semantics stable for UI/tests: total reflects logical all-pairs upper bound.
+    upper_total = (n * (n - 1)) // 2
+    now = time.monotonic()
+    next_emit_ts = now + max(float(progress_interval_s), 0.1)
+
+    def _emit(done: int):
+        nonlocal next_emit_ts
+        if not progress_cb:
+            return
+        d = max(0, min(int(done), upper_total))
+        now2 = time.monotonic()
+        if d in (0, upper_total) or now2 >= next_emit_ts:
+            progress_cb(d, upper_total)
+            next_emit_ts = now2 + max(float(progress_interval_s), 0.1)
+
+    _emit(0)
+
+    # Build cheap candidate blocks to avoid O(n^2) full-pair scans.
+    token_index: Dict[str, List[int]] = {}
+    punct_index: Dict[str, List[int]] = {}
+    token_sets: List[set[str]] = []
+    token_sorts: List[List[str]] = []
+
+    for i, (ln, ld, _freq) in enumerate(known_authors):
+        toks = set(t for t in ln.split() if t)
+        token_sets.append(toks)
+        token_sorts.append(sorted(toks))
+        for t in toks:
+            token_index.setdefault(t, []).append(i)
+        punct = re.sub(r"[\W_]+", "", str(ld).lower())
+        if punct:
+            punct_index.setdefault(punct, []).append(i)
+        if i and i % 1000 == 0:
+            _emit(int(upper_total * 0.08 * (i / max(n, 1))))
+
+    candidate_pairs: set[Tuple[int, int]] = set()
+
+    # Shared-token blocking (skip very common tokens to limit fanout blowups).
+    token_items = list(token_index.items())
+    for ti, (_t, ids) in enumerate(token_items):
+        if len(ids) > 1200:
+            continue
+        for a in range(len(ids)):
+            ia = ids[a]
+            for b in range(a + 1, len(ids)):
+                ib = ids[b]
+                if ia < ib:
+                    candidate_pairs.add((ia, ib))
+                else:
+                    candidate_pairs.add((ib, ia))
+        if ti and ti % 500 == 0:
+            _emit(int(upper_total * (0.08 + 0.22 * (ti / max(len(token_items), 1)))))
+
+    # Punctuation-only key blocking catches punctuation/spacing variants quickly.
+    punct_items = list(punct_index.items())
+    for pi, (_k, ids) in enumerate(punct_items):
+        if len(ids) < 2:
+            continue
+        for a in range(len(ids)):
+            ia = ids[a]
+            for b in range(a + 1, len(ids)):
+                ib = ids[b]
+                if ia < ib:
+                    candidate_pairs.add((ia, ib))
+                else:
+                    candidate_pairs.add((ib, ia))
+        if pi and pi % 500 == 0:
+            _emit(int(upper_total * (0.30 + 0.10 * (pi / max(len(punct_items), 1)))))
+
+    total_candidates = len(candidate_pairs)
+    checked_pairs = 0
+    check_every = max(int(progress_every), 1)
+
+    for i, j in candidate_pairs:
+        ln, ld, _lf = known_authors[i]
+        rn, rd, _rf = known_authors[j]
+        checked_pairs += 1
+
+        shared = len(token_sets[i] & token_sets[j])
+        punct_only = _punctuation_only_variant(ld, rd)
+        if shared == 0 and not punct_only:
+            if checked_pairs % check_every == 0 or checked_pairs == total_candidates:
+                # 40%-100% reserved for candidate evaluation phase.
+                frac = (checked_pairs / max(total_candidates, 1))
+                _emit(int(upper_total * (0.40 + 0.60 * frac)))
+            continue
+
+        jacc = _token_jaccard(ln, rn)
+        if jacc < 0.15 and not punct_only:
+            seq = 0.0
+        else:
+            seq = SequenceMatcher(None, ln, rn).ratio()
+
+        sim = 0.62 * jacc + 0.38 * seq
+        reason = "token+string similarity"
+        if token_sorts[i] == token_sorts[j]:
+            sim = max(sim, 0.97)
+            reason = "comma-order variant"
+        elif "," in ld or "," in rd:
+            reason = "comma-order variant"
+        elif punct_only:
+            reason = "punctuation-only difference"
+
+        if sim >= threshold:
+            auto_merge_safe = sim >= 0.98 and punct_only
+            suggestions.append(MergeSuggestion(ld, rd, sim, reason, auto_merge_safe))
+
+        if checked_pairs % check_every == 0 or checked_pairs == total_candidates:
+            frac = (checked_pairs / max(total_candidates, 1))
+            _emit(int(upper_total * (0.40 + 0.60 * frac)))
+
+    _emit(upper_total)
+
+    suggestions.sort(key=lambda s: (s.similarity, s.left_name, s.right_name), reverse=True)
+    logger.debug(
+        "merge_suggestions count=%s candidate_pairs=%s upper_total_pairs=%s",
+        len(suggestions), total_candidates, upper_total,
+    )
+    return suggestions
 
     # Build cheap candidate blocks to avoid O(n^2) full-pair scans.
     # We block by shared normalized tokens and punctuation-free display keys.
