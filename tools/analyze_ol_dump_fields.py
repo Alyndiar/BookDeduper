@@ -8,6 +8,8 @@ from pathlib import Path
 
 def analyze(path: Path, limit: int | None = None, progress_every: int = 500000):
     top_level_keys = Counter()
+    watched_fields = ("key", "last_modified", "name", "personal_name", "alternate_names", "fuller_name")
+    watched_present = Counter()
     missing_type_key = 0
     non_author_type = Counter()
     bad_json = 0
@@ -38,6 +40,9 @@ def analyze(path: Path, limit: int | None = None, progress_every: int = 500000):
 
             for k in payload.keys():
                 top_level_keys[k] += 1
+            for f in watched_fields:
+                if f in payload and payload.get(f) not in (None, "", []):
+                    watched_present[f] += 1
 
             t = payload.get("type")
             if isinstance(t, dict):
@@ -60,6 +65,10 @@ def analyze(path: Path, limit: int | None = None, progress_every: int = 500000):
         print("non_/type/author type.key values:")
         for key, count in non_author_type.most_common(10):
             print(f"  {key!r}: {count}")
+
+    print("\nWatched field presence:")
+    for f in watched_fields:
+        print(f"  {f}: {watched_present.get(f, 0)}")
 
     print("\nTop payload keys:")
     for key, count in top_level_keys.most_common(50):

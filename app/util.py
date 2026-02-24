@@ -93,15 +93,66 @@ def discover_latest_author_dump_file(folder: str) -> tuple[str | None, str | Non
     return os.path.join(folder, best_name), best_date
 
 
-def extract_author_name_from_dump_line(line: str) -> str:
+def parse_author_dump_line(line: str) -> Optional[dict[str, Any]]:
     parts = line.rstrip("\n").split("\t", 4)
     if len(parts) < 5:
-        return ""
+        return None
     try:
         payload = json.loads(parts[4])
     except Exception:
-        return ""
-    return str(payload.get("name") or "").strip()
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    ol_key = str(payload.get("key") or "").strip()
+    canonical_name = str(payload.get("name") or "").strip()
+    if not ol_key or not canonical_name:
+        return None
+
+    last_modified = ""
+    lm = payload.get("last_modified")
+    if isinstance(lm, dict):
+        last_modified = str(lm.get("value") or "").strip()
+    if not last_modified:
+        last_modified = str(parts[3] or "").strip()
+
+    canonical_norm = normalize_text(canonical_name)
+    token_count = len([t for t in canonical_norm.split() if t])
+
+    aliases_norm: list[str] = []
+    seen: set[str] = set()
+
+    def _add_alias(raw_name: Any):
+        txt = str(raw_name or "").strip()
+        if not txt:
+            return
+        n = normalize_text(txt)
+        if not n or n in seen:
+            return
+        seen.add(n)
+        aliases_norm.append(n)
+
+    _add_alias(canonical_name)
+    _add_alias(payload.get("personal_name"))
+    _add_alias(payload.get("fuller_name"))
+    alternates = payload.get("alternate_names")
+    if isinstance(alternates, list):
+        for a in alternates:
+            _add_alias(a)
+
+    return {
+        "ol_key": ol_key,
+        "last_modified": last_modified,
+        "canonical_name": canonical_name,
+        "canonical_norm": canonical_norm,
+        "aliases_norm": aliases_norm,
+        "token_count": token_count,
+    }
+
+
+def extract_author_name_from_dump_line(line: str) -> str:
+    rec = parse_author_dump_line(line)
+    return str(rec.get("canonical_name") or "") if rec else ""
 
 
 def is_single_token_name(norm: str) -> bool:

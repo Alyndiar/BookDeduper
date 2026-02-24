@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (
     QMessageBox, QAbstractItemView, QDialog, QFormLayout, QLineEdit, QTextEdit, QDialogButtonBox
 )
 
-from .util import normalize_text, discover_latest_author_dump_file, extract_author_name_from_dump_line
+from .util import normalize_text, discover_latest_author_dump_file, parse_author_dump_line
 
 
 DUMP_PREFIX = "ol_dump_authors_"
@@ -379,10 +379,6 @@ class AuthorsTab(QWidget):
             db.set_state("authors_dump_last_date", dump_date)
 
             if restart:
-                db.execute(
-                    "DELETE FROM known_authors WHERE normalized_name IN (SELECT normalized_name FROM author_dump_imported)"
-                )
-                db.execute("DELETE FROM author_dump_imported")
                 db.set_state("authors_dump_last_line", "0")
 
             line_no = 0
@@ -391,14 +387,27 @@ class AuthorsTab(QWidget):
                     line_no += 1
                     if line_no <= start_line:
                         continue
-                    name = extract_author_name_from_dump_line(line)
-                    if not name:
+                    rec = parse_author_dump_line(line)
+                    if not rec:
                         skipped += 1
                         continue
-                    norm = normalize_text(name)
+
+                    norm = str(rec["canonical_norm"] or "")
                     if not norm:
                         skipped += 1
                         continue
+                    if int(rec.get("token_count") or 0) > 10:
+                        skipped += 1
+                        continue
+
+                    ol_key = str(rec["ol_key"])
+                    last_modified = str(rec.get("last_modified") or "")
+                    prev = db.query_one("SELECT last_modified FROM author_dump_records WHERE ol_key=?", (ol_key,))
+                    if prev and str(prev["last_modified"] or "") == last_modified:
+                        skipped += 1
+                        continue
+
+                    name = str(rec["canonical_name"])
                     db.execute(
                         "INSERT INTO known_authors(normalized_name,canonical_name,preferred_name,frequency,created_at,updated_at) VALUES(?,?,?,?,strftime('%s','now'),strftime('%s','now')) ON CONFLICT(normalized_name) DO UPDATE SET canonical_name=excluded.canonical_name, preferred_name=excluded.preferred_name, updated_at=excluded.updated_at",
                         (norm, name, name, 1),
@@ -407,6 +416,17 @@ class AuthorsTab(QWidget):
                         "INSERT INTO author_dump_imported(normalized_name,dump_date,updated_at) VALUES(?,?,strftime('%s','now')) ON CONFLICT(normalized_name) DO UPDATE SET dump_date=excluded.dump_date, updated_at=excluded.updated_at",
                         (norm, dump_date),
                     )
+                    db.execute(
+                        "INSERT INTO author_dump_records(ol_key,last_modified,author_norm,canonical_name,dump_date,updated_at) VALUES(?,?,?,?,?,strftime('%s','now')) ON CONFLICT(ol_key) DO UPDATE SET last_modified=excluded.last_modified, author_norm=excluded.author_norm, canonical_name=excluded.canonical_name, dump_date=excluded.dump_date, updated_at=excluded.updated_at",
+                        (ol_key, last_modified, norm, name, dump_date),
+                    )
+
+                    for alias_norm in list(rec.get("aliases_norm") or []):
+                        db.execute(
+                            "INSERT INTO author_aliases(alias_norm,author_norm,author_display,confidence,source,updated_at) VALUES(?,?,?,?,?,strftime('%s','now')) ON CONFLICT(alias_norm) DO UPDATE SET author_norm=excluded.author_norm, author_display=excluded.author_display, confidence=excluded.confidence, source='dump', updated_at=excluded.updated_at",
+                            (alias_norm, norm, alias_norm, 1.0, "dump"),
+                        )
+
                     imported += 1
 
                     if line_no % 2000 == 0:

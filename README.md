@@ -48,6 +48,7 @@ python main.py
 - Review/Delete requires completed analysis.
 - If 7-Zip is unavailable, archive inner format guessing falls back to filename tags only.
 - Authors tab supports importing approved authors from local Open Library dump files named `ol_dump_authors_YYYY-MM-DD.txt` stored next to the project DB, with resumable progress tracking.
+- Dump import parser uses only `key`, `last_modified`, `name`, `personal_name`, `alternate_names`, and `fuller_name`; other payload fields are ignored.
 
 ## Project structure
 
