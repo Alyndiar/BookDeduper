@@ -15,9 +15,10 @@ class ScanTab(QWidget):
             return {"commit_every": 200000, "checkpoint_every_s": 12.0}
         return {"commit_every": 8000, "checkpoint_every_s": 2.0}
 
-    def __init__(self, get_db, on_scan_completed, on_activity_progress=None):
+    def __init__(self, get_db, get_author_db, on_scan_completed, on_activity_progress=None):
         super().__init__()
         self.get_db = get_db
+        self.get_author_db = get_author_db
         self.on_scan_completed = on_scan_completed
         self.on_activity_progress = on_activity_progress
 
@@ -95,7 +96,7 @@ class ScanTab(QWidget):
         cfg = ScanConfig(folder_skip_enabled=folder_skip, sevenzip_path=sevenzip_path, commit_every=tuning["commit_every"], checkpoint_every_s=tuning["checkpoint_every_s"])
 
         self.thread = QThread()
-        self.worker = ScanWorker(db, cfg)
+        self.worker = ScanWorker(db, cfg, author_db=self.get_author_db())
         self.worker.moveToThread(self.thread)
 
         self.thread.started.connect(self.worker.run)

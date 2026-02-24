@@ -5,6 +5,7 @@ from PySide6.QtGui import QCloseEvent, QFontDatabase, QFontMetrics
 from PySide6.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QTabWidget, QLabel, QStatusBar, QProgressBar
 
 from .db import DB
+from .author_db import AuthorDB
 from .ui_project import ProjectTab
 from .ui_roots import RootsTab
 from .ui_scan import ScanTab
@@ -21,6 +22,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("BookDeduper (Project DB)")
 
         self.db: DB | None = None
+        self.author_db: AuthorDB | None = None
         self._io_reads = 0
         self._io_writes = 0
         self._last_stats = {
@@ -33,13 +35,11 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.setTabsClosable(False)
         self.project_tab = ProjectTab(on_project_opened=self.on_project_opened, on_activity_progress=self.on_activity_progress)
-        self.scan_tab = ScanTab(get_db=lambda: self.db, on_scan_completed=self.on_scan_completed, on_activity_progress=self.on_activity_progress)
-        self.analyze_tab = AnalyzeTab(get_db=lambda: self.db, on_analyze_completed=self.on_analyze_completed, on_activity_progress=self.on_activity_progress)
         self.roots_tab = RootsTab(get_db=lambda: self.db)
-        self.scan_tab = ScanTab(get_db=lambda: self.db, on_scan_completed=self.on_scan_completed)
-        self.analyze_tab = AnalyzeTab(get_db=lambda: self.db, on_analyze_completed=self.on_analyze_completed)
-        self.review_tab = ReviewTab(get_db=lambda: self.db)
-        self.authors_tab = AuthorsTab(get_db=lambda: self.db)
+        self.scan_tab = ScanTab(get_db=lambda: self.db, get_author_db=lambda: self.author_db, on_scan_completed=self.on_scan_completed, on_activity_progress=self.on_activity_progress)
+        self.analyze_tab = AnalyzeTab(get_db=lambda: self.db, get_author_db=lambda: self.author_db, on_analyze_completed=self.on_analyze_completed, on_activity_progress=self.on_activity_progress)
+        self.review_tab = ReviewTab(get_db=lambda: self.db, get_author_db=lambda: self.author_db)
+        self.authors_tab = AuthorsTab(get_db=lambda: self.db, get_author_db=lambda: self.author_db)
 
         self.tabs.addTab(self.project_tab, "1) Project")
         self.tabs.addTab(self.roots_tab, "2) Roots")
@@ -115,7 +115,6 @@ class MainWindow(QMainWindow):
         label.setFont(font)
         label.setFixedWidth(fm.horizontalAdvance(template) + 10)
         return label
-
 
     def _make_io_box(self, label: str, font) -> QLabel:
         box = QLabel(label)
@@ -193,14 +192,15 @@ class MainWindow(QMainWindow):
             return {}
         files = self._safe_i(self.db.query_one("SELECT COUNT(*) AS c FROM files"), "c")
         folders = self._safe_i(self.db.query_one("SELECT COUNT(*) AS c FROM folders"), "c")
-        authors = self._safe_i(self.db.query_one("SELECT COUNT(*) AS c FROM known_authors"), "c")
+        authors = 0
+        if self.author_db:
+            authors = self._safe_i(self.author_db.query_one("SELECT COUNT(*) AS c FROM known_authors"), "c")
         dup_found = self.db.query_one(
             "SELECT COUNT(*) AS files, COUNT(DISTINCT work_key) AS groups FROM deletion_queue"
         )
         dup_todo = self.db.query_one(
             "SELECT COUNT(*) AS files, COUNT(DISTINCT work_key) AS groups FROM deletion_queue WHERE checked=1"
         )
-
         return {
             "files": files,
             "folders": folders,
@@ -242,14 +242,12 @@ class MainWindow(QMainWindow):
                 st.get("dup_found_groups", 0),
                 st.get("dup_found_files", 0),
                 st.get("dup_todo_groups", 0),
-                st.get("dup_todo_files", 0),
+                st.get("dup_todo_groups", 0),
             )
         finally:
             self._refreshing_status = False
 
-
     def on_activity_progress(self, text: str, pct: float = -1.0):
-        # Generic status-bar progress channel for long operations (DB open/save/analyze/scan).
         if pct < 0:
             self.activity_progress.setRange(0, 100)
             self.activity_progress.setValue(0)
@@ -257,22 +255,30 @@ class MainWindow(QMainWindow):
             return
         if pct > 100:
             pct = 100
-        if pct < 0:
-            pct = 0
         self.status_label.setText(f" {text} ")
         self.activity_progress.setRange(0, 100)
         self.activity_progress.setValue(int(pct))
         self.activity_progress.setFormat(f"{pct:.0f}%")
 
-    def on_project_opened(self, db: DB):
+    def on_project_opened(self, db: DB, author_db: AuthorDB | None):
         if self.db:
             try:
                 self.db.remove_io_callback(self._io_callback)
                 self.db.close()
             except Exception:
                 pass
+        if self.author_db:
+            try:
+                self.author_db.remove_io_callback(self._io_callback)
+                self.author_db.close()
+            except Exception:
+                pass
+
         self.db = db
+        self.author_db = author_db
         self.db.add_io_callback(self._io_callback)
+        if self.author_db:
+            self.author_db.add_io_callback(self._io_callback)
 
         self.tabs.setTabEnabled(1, True)
         self.roots_tab.refresh()
@@ -284,8 +290,8 @@ class MainWindow(QMainWindow):
         self.tabs.setTabEnabled(2, True)
         self.tabs.setTabEnabled(3, scan_done)
         self.tabs.setTabEnabled(4, analyze_done)
-        has_author_db = bool(self.db.query_one("SELECT 1 FROM known_authors LIMIT 1") or self.db.query_one("SELECT 1 FROM invalid_authors LIMIT 1"))
-        self.tabs.setTabEnabled(5, (authors_done or analyze_done) and has_author_db)
+        has_author_db = self.author_db is not None
+        self.tabs.setTabEnabled(5, has_author_db or authors_done or analyze_done)
 
         self.scan_tab.refresh()
         self.analyze_tab.refresh()
@@ -313,16 +319,13 @@ class MainWindow(QMainWindow):
             self.tabs.setTabEnabled(4, True)
             self.review_tab.refresh()
             self.authors_tab.refresh()
-            has_author_db = bool(self.db.query_one("SELECT 1 FROM known_authors LIMIT 1") or self.db.query_one("SELECT 1 FROM invalid_authors LIMIT 1"))
-            self.tabs.setTabEnabled(5, has_author_db)
+            self.tabs.setTabEnabled(5, True)
             self.tabs.setCurrentIndex(4)
         else:
             self.tabs.setTabEnabled(4, False)
-            self.tabs.setTabEnabled(5, False)
         self.refresh_all_statuses()
 
     def closeEvent(self, event: QCloseEvent):
-        # Ensure processing is safely stopped so resumable checkpoints are persisted.
         try:
             if self.scan_tab.thread and self.scan_tab.worker:
                 self.scan_tab.worker.request_stop()
@@ -340,6 +343,11 @@ class MainWindow(QMainWindow):
             if self.db:
                 try:
                     self.db.close()
+                except Exception:
+                    pass
+            if self.author_db:
+                try:
+                    self.author_db.close()
                 except Exception:
                     pass
             super().closeEvent(event)

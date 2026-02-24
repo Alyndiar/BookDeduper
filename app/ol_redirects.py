@@ -2,10 +2,9 @@ from __future__ import annotations
 import os
 import json
 import logging
-import time
-from typing import Dict, Tuple
+from typing import Dict
 
-from .db import DB
+from .author_db import AuthorDB
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +69,7 @@ def resolve_redirect_target(redirect_map: Dict[str, str], key: str, max_depth: i
     return cur, True
 
 
-def _start_or_resume_run(db: DB, dump_date: str, dump_file: str) -> tuple[int, int, bool]:
+def _start_or_resume_run(db: AuthorDB, dump_date: str, dump_file: str) -> tuple[int, int, bool]:
     db.execute(
         "UPDATE ol_import_runs SET status='obsolete', updated_at=strftime('%s','now') WHERE import_type='ol_redirects' AND dump_date<>? AND status IN ('running','failed','completed')",
         (dump_date,),
@@ -95,7 +94,7 @@ def _start_or_resume_run(db: DB, dump_date: str, dump_file: str) -> tuple[int, i
     return rid, 0, False
 
 
-def import_latest_redirect_dump(db: DB, folder: str, checkpoint_every: int = 5000) -> dict:
+def import_latest_redirect_dump(db: AuthorDB, folder: str, checkpoint_every: int = 5000) -> dict:
     dump_file, dump_date = discover_latest_redirect_dump_file(folder)
     if not dump_file or not dump_date:
         return {"ok": False, "message": "No redirect dump found."}
@@ -158,7 +157,7 @@ def import_latest_redirect_dump(db: DB, folder: str, checkpoint_every: int = 500
     return {"ok": True, "message": f"Redirect import completed for {dump_date}.", "run_id": run_id, **mig}
 
 
-def migrate_redirect_aliases(db: DB, dump_date: str) -> dict:
+def migrate_redirect_aliases(db: AuthorDB, dump_date: str) -> dict:
     rows = db.query_all("SELECT from_key,to_key FROM ol_author_redirects WHERE dump_date=?", (dump_date,))
     redirect_map = {str(r["from_key"]): str(r["to_key"]) for r in rows}
     aliases_added = 0
@@ -199,6 +198,7 @@ def migrate_redirect_aliases(db: DB, dump_date: str) -> dict:
                 )
                 aliases_added += 1
 
+            # Remove the superseded author from known_authors; the canonical record remains.
             if from_rec and str(from_rec["author_norm"] or "") != canon_norm:
                 db.execute("DELETE FROM known_authors WHERE normalized_name=?", (str(from_rec["author_norm"]),))
 
@@ -212,3 +212,14 @@ def migrate_redirect_aliases(db: DB, dump_date: str) -> dict:
         raise
 
     return {"aliases_added": aliases_added, "loops": loops, "unresolved": unresolved}
+
+
+def purge_redirect_table(db: AuthorDB, dump_date: str):
+    """Delete all redirect rows for dump_date after migration is complete.
+
+    Call this after migrate_redirect_aliases() to reclaim space. The redirect
+    chains are fully encoded in author_aliases after migration, so this data
+    is no longer needed.
+    """
+    db.execute("DELETE FROM ol_author_redirects WHERE dump_date=?", (dump_date,))
+    logger.info("purge_redirect_table dump_date=%s", dump_date)

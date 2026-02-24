@@ -7,16 +7,18 @@ from PySide6.QtWidgets import (
     QFileDialog, QLineEdit, QMessageBox, QCheckBox, QComboBox
 )
 from .db import DB, MEMORY_PROFILES
+from .author_db import AuthorDB
 from .sevenzip import detect_7z
 
 
 class _OpenProjectWorker(QObject):
     progress = Signal(int, str)
-    finished = Signal(object, object, object)  # db, detected_7z, error
+    finished = Signal(object, object, object, object)  # db, author_db, detected_7z, error
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, author_db_path: str):
         super().__init__()
         self.path = path
+        self.author_db_path = author_db_path
 
     def run(self):
         try:
@@ -25,20 +27,32 @@ class _OpenProjectWorker(QObject):
             if parent:
                 os.makedirs(parent, exist_ok=True)
 
-            self.progress.emit(35, "Opening database")
+            self.progress.emit(30, "Opening project database")
             db = DB(self.path)
 
-            self.progress.emit(70, "Loading project settings")
+            self.progress.emit(55, "Loading project settings")
             profile = db.memory_profile()
             db.apply_memory_profile(profile, db.memory_profile_config(profile))
+
+            author_db = None
+            if self.author_db_path:
+                self.progress.emit(70, "Opening author database")
+                try:
+                    adb_parent = os.path.dirname(self.author_db_path)
+                    if adb_parent:
+                        os.makedirs(adb_parent, exist_ok=True)
+                    author_db = AuthorDB(self.author_db_path)
+                except Exception as e:
+                    # Non-fatal: project works without author DB
+                    author_db = None
 
             self.progress.emit(85, "Detecting 7z")
             existing = db.get_state("7z_path", None)
             p = detect_7z(existing)
             self.progress.emit(100, "Project open complete")
-            self.finished.emit(db, p, None)
+            self.finished.emit(db, author_db, p, None)
         except Exception as e:
-            self.finished.emit(None, None, e)
+            self.finished.emit(None, None, None, e)
 
 
 class ProjectTab(QWidget):
@@ -48,25 +62,41 @@ class ProjectTab(QWidget):
         self.on_activity_progress = on_activity_progress
 
         lay = QVBoxLayout(self)
-        self.info = QLabel("Open or create a project (single SQLite DB file).")
+        self.info = QLabel("Open or create a project (books.sqlite) and link an author DB (authors.sqlite).")
         lay.addWidget(self.info)
 
-        row = QHBoxLayout()
+        # Project DB row
+        lay.addWidget(QLabel("Project DB (books):"))
+        prow = QHBoxLayout()
         self.path_edit = QLineEdit()
-        self.path_edit.setPlaceholderText(r"C:\path\to\project.sqlite")
-        row.addWidget(self.path_edit)
+        self.path_edit.setPlaceholderText(r"C:\path\to\myproject.sqlite")
+        prow.addWidget(self.path_edit)
         self.btn_browse = QPushButton("Browse…")
         self.btn_browse.clicked.connect(self.browse_open)
-        row.addWidget(self.btn_browse)
+        prow.addWidget(self.btn_browse)
         self.btn_open = QPushButton("Open")
         self.btn_open.clicked.connect(self.open_project)
-        row.addWidget(self.btn_open)
+        prow.addWidget(self.btn_open)
         self.btn_new = QPushButton("New…")
         self.btn_new.clicked.connect(self.new_project)
-        row.addWidget(self.btn_new)
-        lay.addLayout(row)
+        prow.addWidget(self.btn_new)
+        lay.addLayout(prow)
 
-        lay.addWidget(QLabel("Settings stored in DB state:"))
+        # Author DB row
+        lay.addWidget(QLabel("Author DB (shared, optional):"))
+        arow = QHBoxLayout()
+        self.author_path_edit = QLineEdit()
+        self.author_path_edit.setPlaceholderText(r"C:\path\to\authors.sqlite  (leave blank to skip)")
+        arow.addWidget(self.author_path_edit)
+        self.btn_author_browse = QPushButton("Browse…")
+        self.btn_author_browse.clicked.connect(self.browse_author)
+        arow.addWidget(self.btn_author_browse)
+        self.btn_author_new = QPushButton("New…")
+        self.btn_author_new.clicked.connect(self.new_author_db)
+        arow.addWidget(self.btn_author_new)
+        lay.addLayout(arow)
+
+        lay.addWidget(QLabel("Settings stored in project DB state:"))
 
         self.chk_folder_skip = QCheckBox("Enable optional folder skipping (heuristic)")
         self.chk_folder_skip.stateChanged.connect(self.save_settings_if_open)
@@ -112,19 +142,19 @@ class ProjectTab(QWidget):
         crow.addWidget(self.custom_wal)
         lay.addLayout(crow)
 
-        prow = QHBoxLayout()
+        prow2 = QHBoxLayout()
         self.btn_import_profile = QPushButton("Import preset → custom")
         self.btn_import_profile.clicked.connect(self.import_preset_to_custom)
-        prow.addWidget(self.btn_import_profile)
+        prow2.addWidget(self.btn_import_profile)
 
         self.btn_save_profile = QPushButton("Save custom profile…")
         self.btn_save_profile.clicked.connect(self.save_custom_profile_to_disk)
-        prow.addWidget(self.btn_save_profile)
+        prow2.addWidget(self.btn_save_profile)
 
         self.btn_load_profile = QPushButton("Load custom profile…")
         self.btn_load_profile.clicked.connect(self.load_custom_profile_from_disk)
-        prow.addWidget(self.btn_load_profile)
-        lay.addLayout(prow)
+        prow2.addWidget(self.btn_load_profile)
+        lay.addLayout(prow2)
 
         zrow = QHBoxLayout()
         self.zlabel = QLabel("7z.exe: (auto-detect after open)")
@@ -148,6 +178,8 @@ class ProjectTab(QWidget):
         self.btn_open.setEnabled(enabled)
         self.btn_new.setEnabled(enabled)
         self.btn_browse.setEnabled(enabled)
+        self.btn_author_browse.setEnabled(enabled)
+        self.btn_author_new.setEnabled(enabled)
 
     def _read_custom_cfg_from_ui(self) -> dict:
         def _ival(edit: QLineEdit, dflt: int) -> int:
@@ -178,6 +210,15 @@ class ProjectTab(QWidget):
         fn, _ = QFileDialog.getOpenFileName(self, "Open project DB", "", "SQLite DB (*.sqlite *.db);;All files (*.*)")
         if fn:
             self.path_edit.setText(fn)
+            # Auto-suggest authors.sqlite alongside the project
+            if not self.author_path_edit.text().strip():
+                suggested = os.path.join(os.path.dirname(fn), "authors.sqlite")
+                self.author_path_edit.setText(suggested)
+
+    def browse_author(self):
+        fn, _ = QFileDialog.getOpenFileName(self, "Open author DB", "", "SQLite DB (*.sqlite *.db);;All files (*.*)")
+        if fn:
+            self.author_path_edit.setText(fn)
 
     def new_project(self):
         fn, _ = QFileDialog.getSaveFileName(self, "Create project DB", "", "SQLite DB (*.sqlite)")
@@ -186,7 +227,18 @@ class ProjectTab(QWidget):
         if not fn.lower().endswith(".sqlite"):
             fn += ".sqlite"
         self.path_edit.setText(fn)
+        if not self.author_path_edit.text().strip():
+            suggested = os.path.join(os.path.dirname(fn), "authors.sqlite")
+            self.author_path_edit.setText(suggested)
         self.open_project(create=True)
+
+    def new_author_db(self):
+        fn, _ = QFileDialog.getSaveFileName(self, "Create author DB", "", "SQLite DB (*.sqlite)")
+        if not fn:
+            return
+        if not fn.lower().endswith(".sqlite"):
+            fn += ".sqlite"
+        self.author_path_edit.setText(fn)
 
     def open_project(self, create: bool = False):
         _ = create
@@ -198,12 +250,14 @@ class ProjectTab(QWidget):
             QMessageBox.information(self, "Project", "Project open already in progress.")
             return
 
+        author_db_path = self.author_path_edit.text().strip()
+
         self._set_open_controls(False)
         self.info.setText("Opening project…")
         self._emit_activity("Opening DB", 0.0)
 
         self._open_thread = QThread()
-        self._open_worker = _OpenProjectWorker(path)
+        self._open_worker = _OpenProjectWorker(path, author_db_path)
         self._open_worker.moveToThread(self._open_thread)
         self._open_thread.started.connect(self._open_worker.run)
         self._open_worker.progress.connect(self._on_open_progress)
@@ -214,7 +268,7 @@ class ProjectTab(QWidget):
         self.info.setText(msg)
         self._emit_activity(msg, float(pct))
 
-    def _on_open_finished(self, db_obj, detected_7z, err):
+    def _on_open_finished(self, db_obj, author_db_obj, detected_7z, err):
         if self._open_thread:
             self._open_thread.quit()
             self._open_thread.wait(3000)
@@ -225,11 +279,18 @@ class ProjectTab(QWidget):
         if err is not None or db_obj is None:
             self._emit_activity("Idle", -1.0)
             QMessageBox.critical(self, "Project", f"Failed to open DB:\n{err!r}")
-            self.info.setText("Open or create a project (single SQLite DB file).")
+            self.info.setText("Open or create a project.")
             return
 
         db = db_obj
         self._db = db
+
+        # Persist the author DB path in the project state so it reloads next time
+        if author_db_obj is not None:
+            db.set_state("author_db_path", author_db_obj.db_path)
+        elif self.author_path_edit.text().strip():
+            db.set_state("author_db_path", self.author_path_edit.text().strip())
+
         self.chk_folder_skip.setChecked(db.get_state("folder_skip_enabled", "0") == "1")
 
         profile = db.memory_profile()
@@ -248,8 +309,13 @@ class ProjectTab(QWidget):
             self.zlabel.setText("7z.exe: NOT FOUND (install 7-Zip or put 7z.exe in PATH)")
 
         self._refresh_custom_controls_enabled()
-        self.on_project_opened(db)
-        self.info.setText("Project opened.")
+        self.on_project_opened(db, author_db_obj)
+        status = "Project opened."
+        if author_db_obj is None and self.author_path_edit.text().strip():
+            status += " (Author DB could not be opened — check path.)"
+        elif author_db_obj is None:
+            status += " (No author DB configured.)"
+        self.info.setText(status)
         self._emit_activity("Idle", -1.0)
 
     def on_memory_profile_changed(self, _text: str):

@@ -5,6 +5,7 @@ import logging
 from typing import Dict, List, Tuple
 from PySide6.QtCore import QObject, Signal
 from .db import DB
+from .author_db import AuthorDB
 from .util import now_ts
 from .parser import detect_quality_tags, parse_filename, build_merge_suggestions
 from .util import normalize_text
@@ -19,9 +20,10 @@ class AnalyzeWorker(QObject):
     stats = Signal(dict)
     finished = Signal(bool, str)
 
-    def __init__(self, db: DB, phase: str = "duplicates", commit_every: int = 2000):
+    def __init__(self, db: DB, phase: str = "duplicates", commit_every: int = 2000, author_db: AuthorDB | None = None):
         super().__init__()
         self.db = db
+        self.author_db = author_db
         self.phase = phase
         self.commit_every = commit_every
         self._pause = False
@@ -61,7 +63,9 @@ class AnalyzeWorker(QObject):
         logger.debug("analyze_backup_created phase=%s path=%s", phase, path)
 
     def _load_invalid_set(self) -> set[str]:
-        rows = self.db.query_all("SELECT normalized_name FROM invalid_authors")
+        if not self.author_db:
+            return set()
+        rows = self.author_db.query_all("SELECT normalized_name FROM invalid_authors")
         return {str(r["normalized_name"] or "").strip() for r in rows if str(r["normalized_name"] or "").strip()}
 
     def _authors_chunk_size(self) -> int:
@@ -174,7 +178,7 @@ class AnalyzeWorker(QObject):
                         part_norm = normalize_text(part)
                         if not part_norm or part_norm == "unknown" or part_norm in invalid_set:
                             continue
-                        approved = self.db.query_one("SELECT 1 FROM known_authors WHERE normalized_name=?", (part_norm,))
+                        approved = self.author_db.query_one("SELECT 1 FROM known_authors WHERE normalized_name=?", (part_norm,)) if self.author_db else None
                         if len([t for t in part_norm.split() if t]) < 2 and not approved:
                             continue
                         if approved:
@@ -225,7 +229,14 @@ class AnalyzeWorker(QObject):
         # recompute suggestions from persisted known_authors only when completed.
         # This step is O(n²); emit percentage progress so long runs remain observable.
         if not self._stop:
-            rows = self.db.query_all("SELECT normalized_name, COALESCE(preferred_name, canonical_name) AS canonical_name, frequency FROM known_authors UNION ALL SELECT normalized_name, COALESCE(preferred_name, canonical_name) AS canonical_name, frequency FROM tentative_authors")
+            # Load known authors from authors.db and tentative authors from books.db, merge in Python.
+            known_rows = self.author_db.query_all(
+                "SELECT normalized_name, COALESCE(preferred_name, canonical_name) AS canonical_name, frequency FROM known_authors"
+            ) if self.author_db else []
+            tentative_rows = self.db.query_all(
+                "SELECT normalized_name, COALESCE(preferred_name, canonical_name) AS canonical_name, frequency FROM tentative_authors"
+            )
+            rows = list(known_rows) + list(tentative_rows)
             author_count = len(rows)
             self.progress.emit(f"Analyze Authors: finalizing merge suggestions for {author_count} authors…")
 

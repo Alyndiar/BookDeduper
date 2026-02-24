@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Dict, Tuple
 from PySide6.QtCore import QObject, Signal
 from .db import DB
+from .author_db import AuthorDB
 from .util import norm_path, file_sig_from_stat, ext_of, is_probably_archive, dumps, loads, now_ts, normalize_text
 from .parser import parse_filename, detect_quality_tags, make_work_key
 from .sevenzip import detect_7z, list_archive_exts
@@ -25,9 +26,10 @@ class ScanWorker(QObject):
     stats = Signal(dict)
     finished = Signal(bool, str)
 
-    def __init__(self, db: DB, cfg: ScanConfig):
+    def __init__(self, db: DB, cfg: ScanConfig, author_db: AuthorDB | None = None):
         super().__init__()
         self.db = db
+        self.author_db = author_db
         self.cfg = cfg
         self._pause = False
         self._stop = False
@@ -162,17 +164,30 @@ class ScanWorker(QObject):
 
 
     def _load_author_aliases(self) -> Dict[str, Tuple[str, str]]:
+        out: Dict[str, Tuple[str, str]] = {}
+        # Load OL-sourced aliases from authors.db (lower priority, loaded first)
+        if self.author_db:
+            try:
+                rows = self.author_db.query_all("SELECT alias_norm, author_norm, author_display FROM author_aliases")
+                for r in rows:
+                    alias_norm = str(r["alias_norm"] or "").strip()
+                    author_norm = str(r["author_norm"] or "").strip()
+                    author_display = str(r["author_display"] or "").strip()
+                    if alias_norm and author_norm and author_display:
+                        out[alias_norm] = (author_norm, author_display)
+            except Exception:
+                pass
+        # Load project-derived aliases from books.db (higher priority, overwrites)
         try:
             rows = self.db.query_all("SELECT alias_norm, author_norm, author_display FROM author_aliases")
+            for r in rows:
+                alias_norm = str(r["alias_norm"] or "").strip()
+                author_norm = str(r["author_norm"] or "").strip()
+                author_display = str(r["author_display"] or "").strip()
+                if alias_norm and author_norm and author_display:
+                    out[alias_norm] = (author_norm, author_display)
         except Exception:
-            return {}
-        out: Dict[str, Tuple[str, str]] = {}
-        for r in rows:
-            alias_norm = str(r["alias_norm"] or "").strip()
-            author_norm = str(r["author_norm"] or "").strip()
-            author_display = str(r["author_display"] or "").strip()
-            if alias_norm and author_norm and author_display:
-                out[alias_norm] = (author_norm, author_display)
+            pass
         return out
 
     def _candidate_author_aliases(self, filename: str) -> List[str]:

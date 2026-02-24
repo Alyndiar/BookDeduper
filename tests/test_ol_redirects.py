@@ -2,7 +2,7 @@ import os
 import tempfile
 import unittest
 
-from app.db import DB
+from app.author_db import AuthorDB
 from app.ol_redirects import (
     discover_latest_redirect_dump_file,
     import_latest_redirect_dump,
@@ -16,8 +16,8 @@ class RedirectDumpTests(unittest.TestCase):
     def setUp(self):
         self.td = tempfile.TemporaryDirectory()
         self.addCleanup(self.td.cleanup)
-        self.db_path = os.path.join(self.td.name, 'p.sqlite')
-        self.db = DB(self.db_path)
+        self.db_path = os.path.join(self.td.name, 'authors.sqlite')
+        self.db = AuthorDB(self.db_path)
         self.addCleanup(lambda: self.db.close())
 
     def _write(self, name: str, lines: list[str]):

@@ -10,8 +10,10 @@ class AnalyzeResumeTests(unittest.TestCase):
     def _make_db(self, profile: str) -> DB:
         fd, path = tempfile.mkstemp(suffix=".sqlite")
         os.close(fd)
-        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
         db = DB(path)
+        # Register close before removal so cleanup runs in order: close → remove.
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        self.addCleanup(db.close)
         db.set_state("scan_completed", "1")
         db.set_state("memory_profile", profile)
         return db

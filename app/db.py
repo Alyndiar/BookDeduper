@@ -5,7 +5,7 @@ import time
 import json
 from typing import Callable, Iterable, Optional
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 1
 
 MEMORY_PROFILES = {
     "safe": {
@@ -27,9 +27,9 @@ MEMORY_PROFILES = {
         "synchronous": "NORMAL",
     },
     "extreme+": {
-        "cache_size": -8388608,      # 8 GiB
-        "mmap_size": 17179869184,    # 16 GiB
-        "wal_autocheckpoint": 120000,
+        "cache_size": -8388608,     # 8 GiB
+        "mmap_size": 17179869184,   # 16 GiB
+        "wal_autocheckpoint": 30000,  # ~120 MB WAL ceiling (was 120000 = 480 MB)
         "synchronous": "NORMAL",
     },
 }
@@ -128,12 +128,49 @@ CREATE TABLE IF NOT EXISTS deletion_queue(
   created_at INTEGER NOT NULL
 );
 
+-- Project-local author tables (derived from scanning this project's files).
+-- Curated global author data lives in authors.db (AuthorDB).
+
+CREATE TABLE IF NOT EXISTS tentative_authors(
+  normalized_name TEXT PRIMARY KEY,
+  canonical_name TEXT NOT NULL,
+  preferred_name TEXT,
+  frequency INTEGER NOT NULL DEFAULT 0,
+  confidence REAL NOT NULL DEFAULT 0.0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS author_variants(
+  normalized_name TEXT NOT NULL,
+  variant_text TEXT NOT NULL,
+  frequency INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(normalized_name, variant_text)
+);
+
+-- Aliases discovered locally from filenames (source='derived').
+-- OL-sourced aliases (source='dump'/'openlibrary_redirect'/'manual') live in authors.db.
+CREATE TABLE IF NOT EXISTS author_aliases(
+  alias_norm TEXT PRIMARY KEY,
+  author_norm TEXT NOT NULL,
+  author_display TEXT NOT NULL,
+  confidence REAL NOT NULL DEFAULT 1.0,
+  source TEXT NOT NULL DEFAULT 'derived',
+  updated_at INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_files_work_key ON files(work_key);
 CREATE INDEX IF NOT EXISTS idx_files_ext ON files(ext);
 CREATE INDEX IF NOT EXISTS idx_files_folder_path ON files(folder_path);
 CREATE INDEX IF NOT EXISTS idx_files_root_mtime ON files(root_id, mtime_ns);
 CREATE INDEX IF NOT EXISTS idx_folders_root ON folders(root_id);
+CREATE INDEX IF NOT EXISTS idx_deletion_queue_work_key ON deletion_queue(work_key);
+CREATE INDEX IF NOT EXISTS idx_tentative_authors_frequency ON tentative_authors(frequency);
+CREATE INDEX IF NOT EXISTS idx_author_variants_norm ON author_variants(normalized_name);
+CREATE INDEX IF NOT EXISTS idx_author_aliases_author_norm ON author_aliases(author_norm);
 """
+
 
 class DB:
     def __init__(self, db_path: str):
@@ -171,171 +208,13 @@ class DB:
             s = stmt.strip()
             if s:
                 cur.execute(s + ";")
-        self._migrate_schema()
-
-    def _migrate_schema(self):
-        raw = self.get_state("schema_version", "1")
+        raw = self.get_state("schema_version", "0")
         try:
-            version = int(raw or "1")
+            version = int(raw or "0")
         except Exception:
-            version = 1
-
-        if version < 2:
-            self.execute(
-                """
-                CREATE TABLE IF NOT EXISTS author_aliases(
-                  alias_norm TEXT PRIMARY KEY,
-                  author_norm TEXT NOT NULL,
-                  author_display TEXT NOT NULL,
-                  confidence REAL NOT NULL DEFAULT 1.0,
-                  source TEXT NOT NULL DEFAULT 'derived',
-                  updated_at INTEGER NOT NULL
-                )
-                """
-            )
-            self.execute("CREATE INDEX IF NOT EXISTS idx_author_aliases_author_norm ON author_aliases(author_norm)")
-            version = 2
-
-        if version < 3:
-            self.execute(
-                """
-                CREATE TABLE IF NOT EXISTS known_authors(
-                  normalized_name TEXT PRIMARY KEY,
-                  canonical_name TEXT NOT NULL,
-                  frequency INTEGER NOT NULL DEFAULT 0,
-                  created_at INTEGER NOT NULL,
-                  updated_at INTEGER NOT NULL
-                )
-                """
-            )
-            self.execute(
-                """
-                CREATE TABLE IF NOT EXISTS author_variants(
-                  normalized_name TEXT NOT NULL,
-                  variant_text TEXT NOT NULL,
-                  frequency INTEGER NOT NULL DEFAULT 0,
-                  updated_at INTEGER NOT NULL,
-                  PRIMARY KEY(normalized_name, variant_text)
-                )
-                """
-            )
-            self.execute("CREATE INDEX IF NOT EXISTS idx_known_authors_frequency ON known_authors(frequency)")
-            self.execute("CREATE INDEX IF NOT EXISTS idx_author_variants_norm ON author_variants(normalized_name)")
-            version = 3
-
-        if version < 4:
-            self.execute(
-                """
-                CREATE TABLE IF NOT EXISTS invalid_authors(
-                  normalized_name TEXT PRIMARY KEY,
-                  canonical_name TEXT NOT NULL,
-                  reason TEXT,
-                  updated_at INTEGER NOT NULL
-                )
-                """
-            )
-            self.execute("CREATE INDEX IF NOT EXISTS idx_invalid_authors_name ON invalid_authors(canonical_name)")
-            version = 4
-
-        if version < 5:
-            
-            try:
-                self.execute("ALTER TABLE known_authors ADD COLUMN preferred_name TEXT")
-            except Exception:
-                pass
-            self.execute("UPDATE known_authors SET preferred_name=canonical_name WHERE preferred_name IS NULL OR preferred_name='' ")
-            self.execute(
-                """
-                CREATE TABLE IF NOT EXISTS tentative_authors(
-                  normalized_name TEXT PRIMARY KEY,
-                  canonical_name TEXT NOT NULL,
-                  preferred_name TEXT,
-                  frequency INTEGER NOT NULL DEFAULT 0,
-                  confidence REAL NOT NULL DEFAULT 0.0,
-                  created_at INTEGER NOT NULL,
-                  updated_at INTEGER NOT NULL
-                )
-                """
-            )
-            self.execute("CREATE INDEX IF NOT EXISTS idx_tentative_authors_frequency ON tentative_authors(frequency)")
-            version = 5
-
-        if version < 6:
-            self.execute(
-                """
-                CREATE TABLE IF NOT EXISTS author_dump_imported(
-                  normalized_name TEXT PRIMARY KEY,
-                  dump_date TEXT NOT NULL,
-                  updated_at INTEGER NOT NULL
-                )
-                """
-            )
-            self.execute("CREATE INDEX IF NOT EXISTS idx_author_dump_imported_date ON author_dump_imported(dump_date)")
-            version = 6
-
-
-        if version < 7:
-            self.execute(
-                """
-                CREATE TABLE IF NOT EXISTS author_dump_records(
-                  ol_key TEXT PRIMARY KEY,
-                  last_modified TEXT NOT NULL,
-                  author_norm TEXT NOT NULL,
-                  canonical_name TEXT NOT NULL,
-                  dump_date TEXT NOT NULL,
-                  updated_at INTEGER NOT NULL
-                )
-                """
-            )
-            self.execute("CREATE INDEX IF NOT EXISTS idx_author_dump_records_author_norm ON author_dump_records(author_norm)")
-            self.execute("CREATE INDEX IF NOT EXISTS idx_author_dump_records_dump_date ON author_dump_records(dump_date)")
-            version = 7
-
-
-        if version < 8:
-            try:
-                self.execute("ALTER TABLE author_aliases ADD COLUMN source_key TEXT")
-            except Exception:
-                pass
-            self.execute(
-                """
-                CREATE TABLE IF NOT EXISTS ol_import_runs(
-                  id INTEGER PRIMARY KEY,
-                  import_type TEXT NOT NULL,
-                  dump_date TEXT NOT NULL,
-                  dump_filename TEXT NOT NULL,
-                  status TEXT NOT NULL,
-                  started_at INTEGER NOT NULL,
-                  updated_at INTEGER NOT NULL,
-                  completed_at INTEGER,
-                  progress_line INTEGER NOT NULL DEFAULT 0,
-                  rows_processed INTEGER NOT NULL DEFAULT 0,
-                  redirects_stored INTEGER NOT NULL DEFAULT 0,
-                  aliases_added INTEGER NOT NULL DEFAULT 0,
-                  errors_count INTEGER NOT NULL DEFAULT 0,
-                  last_error TEXT
-                )
-                """
-            )
-            self.execute("CREATE INDEX IF NOT EXISTS idx_ol_import_runs_type_date ON ol_import_runs(import_type,dump_date)")
-            self.execute(
-                """
-                CREATE TABLE IF NOT EXISTS ol_author_redirects(
-                  from_key TEXT PRIMARY KEY,
-                  to_key TEXT NOT NULL,
-                  to_key_resolved TEXT,
-                  dump_date TEXT NOT NULL,
-                  last_modified TEXT,
-                  revision INTEGER,
-                  updated_at INTEGER NOT NULL
-                )
-                """
-            )
-            self.execute("CREATE INDEX IF NOT EXISTS idx_ol_author_redirects_dump_date ON ol_author_redirects(dump_date)")
-            version = 8
-
-        self.set_state("schema_version", str(max(version, SCHEMA_VERSION)))
-
+            version = 0
+        if version < SCHEMA_VERSION:
+            self.set_state("schema_version", str(SCHEMA_VERSION))
 
     def _sanitize_memory_profile_cfg(self, cfg: dict) -> dict:
         out = {
@@ -395,7 +274,6 @@ class DB:
         if profile in MEMORY_PROFILES:
             return self._sanitize_memory_profile_cfg(MEMORY_PROFILES[profile])
         return self._sanitize_memory_profile_cfg(MEMORY_PROFILES["balanced"])
-
 
     def backup_to(self, backup_path: str):
         parent = os.path.dirname(backup_path)

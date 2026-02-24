@@ -14,9 +14,10 @@ class AnalyzeTab(QWidget):
             return 100000
         return 5000
 
-    def __init__(self, get_db, on_analyze_completed, on_activity_progress=None):
+    def __init__(self, get_db, get_author_db, on_analyze_completed, on_activity_progress=None):
         super().__init__()
         self.get_db = get_db
+        self.get_author_db = get_author_db
         self.on_analyze_completed = on_analyze_completed
         self.current_phase = "duplicates"
         self.on_activity_progress = on_activity_progress
@@ -102,7 +103,7 @@ class AnalyzeTab(QWidget):
         self.current_phase = phase
         self.thread = QThread()
         commit_every = self._analyze_commit_every(db.get_state("memory_profile", "balanced"))
-        self.worker = AnalyzeWorker(db, phase=phase, commit_every=commit_every)
+        self.worker = AnalyzeWorker(db, phase=phase, commit_every=commit_every, author_db=self.get_author_db())
         self.worker.moveToThread(self.thread)
 
         self.thread.started.connect(self.worker.run)
