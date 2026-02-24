@@ -2,6 +2,7 @@ from __future__ import annotations
 import sqlite3
 import os
 import time
+import json
 from typing import Callable, Iterable, Optional
 
 SCHEMA_VERSION = 8
@@ -336,16 +337,46 @@ class DB:
         self.set_state("schema_version", str(max(version, SCHEMA_VERSION)))
 
 
-    def apply_memory_profile(self, profile: str):
+    def _sanitize_memory_profile_cfg(self, cfg: dict) -> dict:
+        out = {
+            "cache_size": int(cfg.get("cache_size", MEMORY_PROFILES["balanced"]["cache_size"])),
+            "mmap_size": int(cfg.get("mmap_size", MEMORY_PROFILES["balanced"]["mmap_size"])),
+            "wal_autocheckpoint": int(cfg.get("wal_autocheckpoint", MEMORY_PROFILES["balanced"]["wal_autocheckpoint"])),
+            "synchronous": str(cfg.get("synchronous", "NORMAL") or "NORMAL").upper(),
+        }
+        if out["synchronous"] not in ("OFF", "NORMAL", "FULL", "EXTRA"):
+            out["synchronous"] = "NORMAL"
+        return out
+
+    def _load_custom_memory_profile_cfg(self) -> dict:
+        raw = self.get_state("memory_profile_custom", "") or ""
+        if not raw:
+            return self._sanitize_memory_profile_cfg(MEMORY_PROFILES["balanced"])
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return self._sanitize_memory_profile_cfg(MEMORY_PROFILES["balanced"])
+        if not isinstance(data, dict):
+            return self._sanitize_memory_profile_cfg(MEMORY_PROFILES["balanced"])
+        return self._sanitize_memory_profile_cfg(data)
+
+    def _save_custom_memory_profile_cfg(self, cfg: dict):
+        clean = self._sanitize_memory_profile_cfg(cfg)
+        self.set_state("memory_profile_custom", json.dumps(clean, ensure_ascii=False))
+
+    def apply_memory_profile(self, profile: str, custom_cfg: Optional[dict] = None):
         profile = (profile or "balanced").strip().lower()
-        if profile not in MEMORY_PROFILES:
-            profile = "balanced"
-        cfg = MEMORY_PROFILES[profile]
+        if profile == "custom":
+            cfg = self._sanitize_memory_profile_cfg(custom_cfg if custom_cfg is not None else self._load_custom_memory_profile_cfg())
+            self._save_custom_memory_profile_cfg(cfg)
+        else:
+            if profile not in MEMORY_PROFILES:
+                profile = "balanced"
+            cfg = self._sanitize_memory_profile_cfg(MEMORY_PROFILES[profile])
+
         self.execute(f"PRAGMA synchronous={cfg['synchronous']};")
         self.execute("PRAGMA temp_store=MEMORY;")
         self.execute("PRAGMA cache_spill=OFF;")
-        # SQLite PRAGMA statements do not support parameter placeholders here.
-        # Use validated integer values from MEMORY_PROFILES to avoid syntax errors.
         self.execute(f"PRAGMA cache_size={int(cfg['cache_size'])};")
         self.execute(f"PRAGMA mmap_size={int(cfg['mmap_size'])};")
         self.execute(f"PRAGMA wal_autocheckpoint={int(cfg['wal_autocheckpoint'])};")
@@ -353,7 +384,17 @@ class DB:
 
     def memory_profile(self) -> str:
         p = (self.get_state("memory_profile", "balanced") or "balanced").strip().lower()
+        if p == "custom":
+            return "custom"
         return p if p in MEMORY_PROFILES else "balanced"
+
+    def memory_profile_config(self, profile: str) -> dict:
+        profile = (profile or "balanced").strip().lower()
+        if profile == "custom":
+            return self._load_custom_memory_profile_cfg()
+        if profile in MEMORY_PROFILES:
+            return self._sanitize_memory_profile_cfg(MEMORY_PROFILES[profile])
+        return self._sanitize_memory_profile_cfg(MEMORY_PROFILES["balanced"])
 
 
     def backup_to(self, backup_path: str):

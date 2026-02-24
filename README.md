@@ -50,6 +50,7 @@ python main.py
 - Authors tab supports importing approved authors from local Open Library dump files named `ol_dump_authors_YYYY-MM-DD.txt` stored next to the project DB, with resumable progress tracking.
 - Dump import parser uses only `key`, `last_modified`, `name`, `personal_name`, `alternate_names`, and `fuller_name`; other payload fields are ignored.
 - Redirect dump import is supported from local files named `ol_dump_redirects_YYYY-MM-DD.txt`; the newest file is selected automatically, import is resumable, and redirect aliases are migrated to canonical authors.
+- Project tab supports a `custom` memory profile with editable SQLite tuning values, preset import into custom, and save/load custom profile JSON on disk; active values persist in project DB state.
 
 ## Project structure
 
