@@ -4,7 +4,7 @@ import os
 import time
 from typing import Callable, Iterable, Optional
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 MEMORY_PROFILES = {
     "safe": {
@@ -289,6 +289,49 @@ class DB:
             self.execute("CREATE INDEX IF NOT EXISTS idx_author_dump_records_author_norm ON author_dump_records(author_norm)")
             self.execute("CREATE INDEX IF NOT EXISTS idx_author_dump_records_dump_date ON author_dump_records(dump_date)")
             version = 7
+
+
+        if version < 8:
+            try:
+                self.execute("ALTER TABLE author_aliases ADD COLUMN source_key TEXT")
+            except Exception:
+                pass
+            self.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ol_import_runs(
+                  id INTEGER PRIMARY KEY,
+                  import_type TEXT NOT NULL,
+                  dump_date TEXT NOT NULL,
+                  dump_filename TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  started_at INTEGER NOT NULL,
+                  updated_at INTEGER NOT NULL,
+                  completed_at INTEGER,
+                  progress_line INTEGER NOT NULL DEFAULT 0,
+                  rows_processed INTEGER NOT NULL DEFAULT 0,
+                  redirects_stored INTEGER NOT NULL DEFAULT 0,
+                  aliases_added INTEGER NOT NULL DEFAULT 0,
+                  errors_count INTEGER NOT NULL DEFAULT 0,
+                  last_error TEXT
+                )
+                """
+            )
+            self.execute("CREATE INDEX IF NOT EXISTS idx_ol_import_runs_type_date ON ol_import_runs(import_type,dump_date)")
+            self.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ol_author_redirects(
+                  from_key TEXT PRIMARY KEY,
+                  to_key TEXT NOT NULL,
+                  to_key_resolved TEXT,
+                  dump_date TEXT NOT NULL,
+                  last_modified TEXT,
+                  revision INTEGER,
+                  updated_at INTEGER NOT NULL
+                )
+                """
+            )
+            self.execute("CREATE INDEX IF NOT EXISTS idx_ol_author_redirects_dump_date ON ol_author_redirects(dump_date)")
+            version = 8
 
         self.set_state("schema_version", str(max(version, SCHEMA_VERSION)))
 

@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
 )
 
 from .util import normalize_text, discover_latest_author_dump_file, parse_author_dump_line
+from .ol_redirects import import_latest_redirect_dump
 
 
 DUMP_PREFIX = "ol_dump_authors_"
@@ -129,6 +130,10 @@ class AuthorsTab(QWidget):
         b_import = QPushButton("Import author dump")
         b_import.clicked.connect(self.import_author_dump)
         btns2.addWidget(b_import)
+
+        b_redirects = QPushButton("Import redirect dump")
+        b_redirects.clicked.connect(self.import_redirect_dump)
+        btns2.addWidget(b_redirects)
 
         b_clear_approved = QPushButton("Clear Approved")
         b_clear_approved.clicked.connect(lambda: self.clear_list("approved"))
@@ -447,4 +452,17 @@ class AuthorsTab(QWidget):
             "Author dump",
             f"Processed dump {os.path.basename(dump_path)}. Imported/updated {imported} author(s); skipped {skipped}."
         )
+        self.refresh()
+
+
+    def import_redirect_dump(self):
+        db = self.get_db()
+        if not db:
+            return
+        folder = os.path.dirname(db.db_path) or os.getcwd()
+        res = import_latest_redirect_dump(db, folder)
+        if not res.get("ok"):
+            QMessageBox.warning(self, "Redirect dump", str(res.get("message") or "Failed."))
+            return
+        QMessageBox.information(self, "Redirect dump", str(res.get("message") or "Done."))
         self.refresh()
