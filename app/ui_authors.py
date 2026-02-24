@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (
     QMessageBox, QAbstractItemView, QDialog, QFormLayout, QLineEdit, QTextEdit, QDialogButtonBox
 )
 
-from .util import normalize_text, discover_latest_author_dump_file, extract_author_name_from_dump_line, is_single_token_name
+from .util import normalize_text, discover_latest_author_dump_file, extract_author_name_from_dump_line
 
 
 DUMP_PREFIX = "ol_dump_authors_"
@@ -399,12 +399,6 @@ class AuthorsTab(QWidget):
                     if not norm:
                         skipped += 1
                         continue
-                    if is_single_token_name(norm):
-                        known = db.query_one("SELECT 1 FROM known_authors WHERE normalized_name=?", (norm,))
-                        if not known:
-                            skipped += 1
-                            continue
-
                     db.execute(
                         "INSERT INTO known_authors(normalized_name,canonical_name,preferred_name,frequency,created_at,updated_at) VALUES(?,?,?,?,strftime('%s','now'),strftime('%s','now')) ON CONFLICT(normalized_name) DO UPDATE SET canonical_name=excluded.canonical_name, preferred_name=excluded.preferred_name, updated_at=excluded.updated_at",
                         (norm, name, name, 1),

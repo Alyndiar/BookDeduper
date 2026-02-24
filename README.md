@@ -61,6 +61,12 @@ python main.py
 
 ## Troubleshooting
 
+- To profile which JSON fields are present in a large Open Library dump before parser changes, run:
+
+  ```bash
+  python tools/analyze_ol_dump_fields.py /path/to/ol_dump_authors_YYYY-MM-DD.txt --progress-every 500000
+  ```
+
 - If startup fails, verify dependencies are installed and run:
 
   ```bash

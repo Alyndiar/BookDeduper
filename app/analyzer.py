@@ -174,9 +174,9 @@ class AnalyzeWorker(QObject):
                         part_norm = normalize_text(part)
                         if not part_norm or part_norm == "unknown" or part_norm in invalid_set:
                             continue
-                        if len([t for t in part_norm.split() if t]) < 2:
-                            continue
                         approved = self.db.query_one("SELECT 1 FROM known_authors WHERE normalized_name=?", (part_norm,))
+                        if len([t for t in part_norm.split() if t]) < 2 and not approved:
+                            continue
                         if approved:
                             k = (part_norm, part)
                             variant_delta[k] = int(variant_delta.get(k, 0)) + 1
