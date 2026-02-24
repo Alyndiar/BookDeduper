@@ -5,10 +5,22 @@ from .scanner import ScanWorker, ScanConfig
 from .sevenzip import detect_7z
 
 class ScanTab(QWidget):
-    def __init__(self, get_db, on_scan_completed):
+    def _scan_tuning(self, profile: str) -> dict:
+        p = (profile or "balanced").lower()
+        if p == "safe":
+            return {"commit_every": 2500, "checkpoint_every_s": 1.0}
+        if p == "extreme":
+            return {"commit_every": 20000, "checkpoint_every_s": 4.0}
+        if p == "extreme+":
+            return {"commit_every": 200000, "checkpoint_every_s": 12.0}
+        return {"commit_every": 8000, "checkpoint_every_s": 2.0}
+
+    def __init__(self, get_db, get_author_db, on_scan_completed, on_activity_progress=None):
         super().__init__()
         self.get_db = get_db
+        self.get_author_db = get_author_db
         self.on_scan_completed = on_scan_completed
+        self.on_activity_progress = on_activity_progress
 
         lay = QVBoxLayout(self)
 
@@ -41,8 +53,10 @@ class ScanTab(QWidget):
 
         lay.addLayout(row)
 
+
         self.thread: QThread | None = None
         self.worker: ScanWorker | None = None
+
 
     def refresh(self):
         db = self.get_db()
@@ -66,15 +80,23 @@ class ScanTab(QWidget):
             QMessageBox.information(self, "Scan", "Scan already running.")
             return
 
+        if db.get_state("backup_before_scan", "0") == "1":
+            try:
+                path = db.create_timestamped_backup(label="scan")
+                self.append(f"Backup created: {path}")
+            except Exception as e:
+                QMessageBox.warning(self, "Scan", f"Backup failed, continuing anyway:\n{e!r}")
+
         folder_skip = (db.get_state("folder_skip_enabled", "0") == "1")
         sevenzip_path = detect_7z(db.get_state("7z_path", None))
         if sevenzip_path:
             db.set_state("7z_path", sevenzip_path)
 
-        cfg = ScanConfig(folder_skip_enabled=folder_skip, sevenzip_path=sevenzip_path)
+        tuning = self._scan_tuning(db.get_state("memory_profile", "balanced"))
+        cfg = ScanConfig(folder_skip_enabled=folder_skip, sevenzip_path=sevenzip_path, commit_every=tuning["commit_every"], checkpoint_every_s=tuning["checkpoint_every_s"])
 
         self.thread = QThread()
-        self.worker = ScanWorker(db, cfg)
+        self.worker = ScanWorker(db, cfg, author_db=self.get_author_db())
         self.worker.moveToThread(self.thread)
 
         self.thread.started.connect(self.worker.run)
@@ -88,6 +110,8 @@ class ScanTab(QWidget):
         self.btn_resume.setEnabled(False)
 
         self.append("=== Scan started/resumed ===")
+        if self.on_activity_progress:
+            self.on_activity_progress("Scanning", 0.0)
         self.thread.start()
 
     def pause(self):
@@ -112,6 +136,8 @@ class ScanTab(QWidget):
     def on_progress(self, msg: str):
         self.status.setText(f"Scan status: {msg}")
         self.append(msg)
+        if self.on_activity_progress:
+            self.on_activity_progress("Scanning", 0.0)
 
     def on_stats(self, st: dict):
         self.status.setText(
@@ -135,4 +161,6 @@ class ScanTab(QWidget):
         self.btn_resume.setEnabled(False)
         self.btn_stop.setEnabled(False)
 
+        if self.on_activity_progress:
+            self.on_activity_progress("Idle", -1.0)
         self.on_scan_completed(ok)

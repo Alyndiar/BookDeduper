@@ -4,6 +4,7 @@ from PySide6.QtWidgets import (
     QFileDialog, QMessageBox, QLabel
 )
 
+
 class RootsTab(QWidget):
     def __init__(self, get_db):
         super().__init__()
@@ -34,6 +35,7 @@ class RootsTab(QWidget):
 
         row.addStretch(1)
         lay.addLayout(row)
+
 
     def refresh(self):
         db = self.get_db()

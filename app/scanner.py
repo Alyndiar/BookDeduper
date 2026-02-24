@@ -1,13 +1,17 @@
 from __future__ import annotations
 import os
 import time
+import logging
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Tuple
 from PySide6.QtCore import QObject, Signal
 from .db import DB
-from .util import norm_path, file_sig_from_stat, ext_of, is_probably_archive, dumps, loads, now_ts
-from .parser import parse_filename, detect_quality_tags
+from .author_db import AuthorDB
+from .util import norm_path, file_sig_from_stat, ext_of, is_probably_archive, dumps, loads, now_ts, normalize_text
+from .parser import parse_filename, detect_quality_tags, make_work_key
 from .sevenzip import detect_7z, list_archive_exts
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class ScanConfig:
@@ -22,9 +26,10 @@ class ScanWorker(QObject):
     stats = Signal(dict)
     finished = Signal(bool, str)
 
-    def __init__(self, db: DB, cfg: ScanConfig):
+    def __init__(self, db: DB, cfg: ScanConfig, author_db: AuthorDB | None = None):
         super().__init__()
         self.db = db
+        self.author_db = author_db
         self.cfg = cfg
         self._pause = False
         self._stop = False
@@ -147,6 +152,106 @@ class ScanWorker(QObject):
         )
         return False
 
+    def _root_id_for_dir(self, current_dir: str, root_pairs: List[Tuple[str, int]]) -> Optional[int]:
+        for rp, rid in root_pairs:
+            if current_dir == rp or current_dir.startswith(rp + os.sep):
+                return rid
+        return None
+
+    def _folder_file_index(self, folder_path: str) -> Dict[str, Tuple[int, int]]:
+        rows = self.db.query_all("SELECT path,size,mtime_ns FROM files WHERE folder_path=?", (folder_path,))
+        return {str(r["path"]): (int(r["size"]), int(r["mtime_ns"])) for r in rows}
+
+
+    def _load_author_aliases(self) -> Dict[str, Tuple[str, str]]:
+        out: Dict[str, Tuple[str, str]] = {}
+        # Load OL-sourced aliases from authors.db (lower priority, loaded first)
+        if self.author_db:
+            try:
+                rows = self.author_db.query_all("SELECT alias_norm, author_norm, author_display FROM author_aliases")
+                for r in rows:
+                    alias_norm = str(r["alias_norm"] or "").strip()
+                    author_norm = str(r["author_norm"] or "").strip()
+                    author_display = str(r["author_display"] or "").strip()
+                    if alias_norm and author_norm and author_display:
+                        out[alias_norm] = (author_norm, author_display)
+            except Exception:
+                pass
+        # Load project-derived aliases from books.db (higher priority, overwrites)
+        try:
+            rows = self.db.query_all("SELECT alias_norm, author_norm, author_display FROM author_aliases")
+            for r in rows:
+                alias_norm = str(r["alias_norm"] or "").strip()
+                author_norm = str(r["author_norm"] or "").strip()
+                author_display = str(r["author_display"] or "").strip()
+                if alias_norm and author_norm and author_display:
+                    out[alias_norm] = (author_norm, author_display)
+        except Exception:
+            pass
+        return out
+
+    def _candidate_author_aliases(self, filename: str) -> List[str]:
+        stem = os.path.basename(filename)
+        if "." in stem:
+            stem = stem.rsplit(".", 1)[0]
+        candidates: List[str] = []
+        for sep in (" - ", " — ", " – ", "_"):
+            if sep in stem:
+                first = stem.split(sep, 1)[0].strip()
+                if first:
+                    candidates.append(first)
+        if not candidates and stem:
+            candidates.append(stem)
+        out: List[str] = []
+        for c in candidates:
+            norm = normalize_text(c)
+            if norm and norm not in out:
+                out.append(norm)
+        return out
+
+    def _try_correct_author(self, parsed, filename: str, alias_map: Dict[str, Tuple[str, str]]) -> bool:
+        if parsed.author_norm and parsed.author_norm != "unknown":
+            return False
+        for alias_norm in self._candidate_author_aliases(filename):
+            hit = alias_map.get(alias_norm)
+            if not hit:
+                continue
+            corrected_norm, corrected_display = hit
+            parsed.author = corrected_display
+            parsed.author_norm = corrected_norm
+            parsed.work_key = make_work_key(parsed.author_norm, parsed.series_norm, parsed.title_norm, self._series_index_norm(parsed.series_index))
+            return True
+        return False
+
+    def _series_index_norm(self, series_index: Optional[float]) -> str:
+        series_index_norm = ""
+        if series_index is not None:
+            series_index_norm = f"{series_index:05.1f}".lstrip("0")
+            if series_index_norm.startswith("."):
+                series_index_norm = "0" + series_index_norm
+        return series_index_norm
+
+    def _learn_author_alias(self, parsed, alias_map: Dict[str, Tuple[str, str]], ts: int):
+        if not parsed.author_norm or parsed.author_norm == "unknown" or not parsed.author:
+            return
+        alias_norm = normalize_text(parsed.author)
+        if not alias_norm:
+            return
+        if alias_norm not in alias_map:
+            alias_map[alias_norm] = (parsed.author_norm, parsed.author)
+            self.db.execute(
+                """
+                INSERT INTO author_aliases(alias_norm,author_norm,author_display,confidence,source,updated_at)
+                VALUES(?,?,?,?,?,?)
+                ON CONFLICT(alias_norm) DO UPDATE SET
+                  author_norm=excluded.author_norm,
+                  author_display=excluded.author_display,
+                  updated_at=excluded.updated_at
+                """,
+                (alias_norm, parsed.author_norm, parsed.author, 1.0, "derived", ts),
+            )
+
+
     def _run_scan(self) -> Tuple[bool, str]:
         roots_rows = self.db.query_all("SELECT id,path FROM roots WHERE enabled=1 ORDER BY id")
         roots = [r["path"] for r in roots_rows]
@@ -155,6 +260,7 @@ class ScanWorker(QObject):
 
         scan_id = self._start_scan_run()
         self._ensure_7z()
+        author_aliases = self._load_author_aliases()
 
         stack = self._load_stack(roots)
         stats = {
@@ -171,7 +277,11 @@ class ScanWorker(QObject):
         current_dir = ""
         last_path = ""
 
-        root_id_by_path = {norm_path(r["path"]): int(r["id"]) for r in roots_rows}
+        root_pairs = sorted(
+            ((norm_path(r["path"]), int(r["id"])) for r in roots_rows),
+            key=lambda item: len(item[0]),
+            reverse=True,
+        )
 
         self.db.begin()
         try:
@@ -181,11 +291,7 @@ class ScanWorker(QObject):
                 current_dir = norm_path(current_dir)
                 last_path = current_dir
 
-                root_id = None
-                for rp, rid in root_id_by_path.items():
-                    if current_dir == rp or current_dir.startswith(rp + os.sep):
-                        root_id = rid
-                        break
+                root_id = self._root_id_for_dir(current_dir, root_pairs)
                 if root_id is None:
                     continue
 
@@ -205,9 +311,12 @@ class ScanWorker(QObject):
                     self.progress.emit(f"Scanning: {current_dir}")
 
                 try:
+                    existing_by_path = self._folder_file_index(current_dir)
+                    dir_interrupted = False
                     with os.scandir(current_dir) as it:
                         for entry in it:
                             if self._stop:
+                                dir_interrupted = True
                                 break
                             self._maybe_pause()
 
@@ -235,8 +344,8 @@ class ScanWorker(QObject):
                             sig = file_sig_from_stat(st)
                             ctime_ns = int(getattr(st, "st_ctime_ns", int(st.st_ctime * 1e9)))
 
-                            row = self.db.query_one("SELECT id,size,mtime_ns FROM files WHERE path=?", (p,))
-                            if row and int(row["size"]) == sig.size and int(row["mtime_ns"]) == sig.mtime_ns:
+                            cached_sig = existing_by_path.get(p)
+                            if cached_sig and cached_sig[0] == sig.size and cached_sig[1] == sig.mtime_ns:
                                 self.db.execute("UPDATE files SET last_seen_scan_id=? WHERE path=?", (scan_id, p))
                                 stats["skipped_unchanged"] += 1
                                 continue
@@ -244,7 +353,15 @@ class ScanWorker(QObject):
                             stats["files_changed"] += 1
 
                             parsed = parse_filename(name)
+                            self._try_correct_author(parsed, name, author_aliases)
+                            ts_now = now_ts()
+                            self._learn_author_alias(parsed, author_aliases, ts_now)
                             tags_lower = detect_quality_tags(parsed.tags)
+
+                            # Remove file-format tags that duplicate the file's own extension for non-archives.
+                            if not is_arch:
+                                parsed.tags = [t for t in parsed.tags if t.strip().lower() != ext.lower()]
+                                tags_lower = detect_quality_tags(parsed.tags)
 
                             inner_guess = None
 
@@ -303,12 +420,9 @@ class ScanWorker(QObject):
                                     scan_id
                                 )
                             )
+                            existing_by_path[p] = (sig.size, sig.mtime_ns)
 
-                            series_index_norm = ""
-                            if parsed.series_index is not None:
-                                series_index_norm = f"{parsed.series_index:05.1f}".lstrip("0")
-                                if series_index_norm.startswith("."):
-                                    series_index_norm = "0" + series_index_norm
+                            series_index_norm = self._series_index_norm(parsed.series_index)
 
                             self.db.execute(
                                 """
@@ -357,6 +471,13 @@ class ScanWorker(QObject):
                 except Exception:
                     continue
 
+                if dir_interrupted and current_dir:
+                    # Preserve exact resumability: re-queue the in-progress folder so a
+                    # stop/reload resumes this directory rather than skipping remaining files.
+                    if current_dir not in stack:
+                        stack.append(current_dir)
+                    last_path = current_dir
+
             self.db.commit()
 
         except Exception:
@@ -365,8 +486,9 @@ class ScanWorker(QObject):
 
         if self._stop:
             self._set_scan_status(scan_id, "aborted")
+            self.progress.emit(f"Scan paused/stopped; checkpoint saved at folder: {current_dir}")
             self._save_checkpoint(scan_id, stack, current_dir, last_path, stats)
-            return False, "Scan aborted."
+            return False, "Scan aborted (progress saved for resume)."
         else:
             self._set_scan_status(scan_id, "completed")
             self._save_checkpoint(scan_id, [], "", "", stats)
