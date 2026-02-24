@@ -68,3 +68,42 @@ def ext_of(name: str) -> str:
     if "." not in base:
         return ""
     return base.rsplit(".", 1)[-1].lower()
+
+
+DUMP_PATTERN = re.compile(r"^ol_dump_authors_(\d{4}-\d{2}-\d{2})\.txt$")
+
+
+def discover_latest_author_dump_file(folder: str) -> tuple[str | None, str | None]:
+    try:
+        names = os.listdir(folder)
+    except Exception:
+        return None, None
+    best_name = None
+    best_date = None
+    for name in names:
+        m = DUMP_PATTERN.match(name)
+        if not m:
+            continue
+        d = m.group(1)
+        if best_date is None or d > best_date:
+            best_date = d
+            best_name = name
+    if not best_name:
+        return None, None
+    return os.path.join(folder, best_name), best_date
+
+
+def extract_author_name_from_dump_line(line: str) -> str:
+    parts = line.rstrip("\n").split("\t", 4)
+    if len(parts) < 5:
+        return ""
+    try:
+        payload = json.loads(parts[4])
+    except Exception:
+        return ""
+    return str(payload.get("name") or "").strip()
+
+
+def is_single_token_name(norm: str) -> bool:
+    tokens = [t for t in norm.split() if t]
+    return len(tokens) <= 1

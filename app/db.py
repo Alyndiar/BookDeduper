@@ -4,7 +4,7 @@ import os
 import time
 from typing import Callable, Iterable, Optional
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 MEMORY_PROFILES = {
     "safe": {
@@ -258,6 +258,19 @@ class DB:
             )
             self.execute("CREATE INDEX IF NOT EXISTS idx_tentative_authors_frequency ON tentative_authors(frequency)")
             version = 5
+
+        if version < 6:
+            self.execute(
+                """
+                CREATE TABLE IF NOT EXISTS author_dump_imported(
+                  normalized_name TEXT PRIMARY KEY,
+                  dump_date TEXT NOT NULL,
+                  updated_at INTEGER NOT NULL
+                )
+                """
+            )
+            self.execute("CREATE INDEX IF NOT EXISTS idx_author_dump_imported_date ON author_dump_imported(dump_date)")
+            version = 6
 
         self.set_state("schema_version", str(max(version, SCHEMA_VERSION)))
 

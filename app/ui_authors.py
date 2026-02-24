@@ -1,16 +1,16 @@
 from __future__ import annotations
-import json
+import os
 import time
-import urllib.parse
-import urllib.request
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QListWidget, QListWidgetItem,
-    QMessageBox, QAbstractItemView, QDialog, QFormLayout, QLineEdit, QTextEdit, QDialogButtonBox, QInputDialog
+    QMessageBox, QAbstractItemView, QDialog, QFormLayout, QLineEdit, QTextEdit, QDialogButtonBox
 )
 
-from .util import normalize_text
+from .util import normalize_text, discover_latest_author_dump_file, extract_author_name_from_dump_line, is_single_token_name
 
+
+DUMP_PREFIX = "ol_dump_authors_"
 
 class AuthorEditDialog(QDialog):
     def __init__(self, parent, title: str, canonical: str, preferred: str, confidence: float, aliases: list[tuple[str, float]]):
@@ -126,8 +126,8 @@ class AuthorsTab(QWidget):
         b_edit.clicked.connect(self.edit_current)
         btns2.addWidget(b_edit)
 
-        b_import = QPushButton("Import online authors")
-        b_import.clicked.connect(self.import_online_authors)
+        b_import = QPushButton("Import author dump")
+        b_import.clicked.connect(self.import_author_dump)
         btns2.addWidget(b_import)
 
         b_clear_approved = QPushButton("Clear Approved")
@@ -343,42 +343,94 @@ class AuthorsTab(QWidget):
         db.set_state("analyze_authors_completed", "0")
         QMessageBox.information(self, "Authors", "Author DB marked dirty. Run Analyze Authors to rebuild.")
 
-    def import_online_authors(self):
+    def import_author_dump(self):
         db = self.get_db()
         if not db:
             return
-        q, ok = QInputDialog.getText(self, "Import authors", "Search term for OpenLibrary authors:")
-        if not ok or not q.strip():
-            return
-        query = urllib.parse.quote(q.strip())
-        url = f"https://openlibrary.org/search/authors.json?q={query}&limit=50"
-        try:
-            with urllib.request.urlopen(url, timeout=15) as resp:
-                data = json.loads(resp.read().decode("utf-8", errors="ignore"))
-        except Exception as e:
-            QMessageBox.warning(self, "Online import", f"Failed: {e!r}")
+
+        folder = os.path.dirname(db.db_path) or os.getcwd()
+        dump_path, dump_date = discover_latest_author_dump_file(folder)
+        if not dump_path or not dump_date:
+            QMessageBox.warning(self, "Author dump", f"No {DUMP_PREFIX}YYYY-MM-DD.txt found in\n{folder}")
             return
 
-        docs = list(data.get("docs") or [])
-        inserted = 0
-        db.begin()
+        prev_date = db.get_state("authors_dump_last_date", "") or ""
+        prev_file = db.get_state("authors_dump_last_file", "") or ""
+        prev_done = db.get_state("authors_dump_completed", "0") == "1"
+        prev_line = int(db.get_state("authors_dump_last_line", "0") or "0")
+
+        restart = False
+        start_line = 0
+        if prev_done and prev_date and dump_date > prev_date:
+            restart = True
+            start_line = 0
+        elif prev_file and os.path.normcase(prev_file) == os.path.normcase(dump_path):
+            start_line = max(0, prev_line)
+        else:
+            start_line = 0
+
+        imported = 0
+        skipped = 0
+
         try:
-            for d in docs:
-                name = str(d.get("name") or "").strip()
-                if not name:
-                    continue
-                norm = normalize_text(name)
-                if not norm:
-                    continue
+            db.begin()
+            db.set_state("authors_dump_completed", "0")
+            db.set_state("authors_dump_last_file", dump_path)
+            db.set_state("authors_dump_last_date", dump_date)
+
+            if restart:
                 db.execute(
-                    "INSERT INTO known_authors(normalized_name,canonical_name,preferred_name,frequency,created_at,updated_at) VALUES(?,?,?,?,strftime('%s','now'),strftime('%s','now')) ON CONFLICT(normalized_name) DO UPDATE SET canonical_name=excluded.canonical_name, preferred_name=excluded.preferred_name, updated_at=excluded.updated_at",
-                    (norm, name, name, 1),
+                    "DELETE FROM known_authors WHERE normalized_name IN (SELECT normalized_name FROM author_dump_imported)"
                 )
-                inserted += 1
+                db.execute("DELETE FROM author_dump_imported")
+                db.set_state("authors_dump_last_line", "0")
+
+            line_no = 0
+            with open(dump_path, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    line_no += 1
+                    if line_no <= start_line:
+                        continue
+                    name = extract_author_name_from_dump_line(line)
+                    if not name:
+                        skipped += 1
+                        continue
+                    norm = normalize_text(name)
+                    if not norm:
+                        skipped += 1
+                        continue
+                    if is_single_token_name(norm):
+                        known = db.query_one("SELECT 1 FROM known_authors WHERE normalized_name=?", (norm,))
+                        if not known:
+                            skipped += 1
+                            continue
+
+                    db.execute(
+                        "INSERT INTO known_authors(normalized_name,canonical_name,preferred_name,frequency,created_at,updated_at) VALUES(?,?,?,?,strftime('%s','now'),strftime('%s','now')) ON CONFLICT(normalized_name) DO UPDATE SET canonical_name=excluded.canonical_name, preferred_name=excluded.preferred_name, updated_at=excluded.updated_at",
+                        (norm, name, name, 1),
+                    )
+                    db.execute(
+                        "INSERT INTO author_dump_imported(normalized_name,dump_date,updated_at) VALUES(?,?,strftime('%s','now')) ON CONFLICT(normalized_name) DO UPDATE SET dump_date=excluded.dump_date, updated_at=excluded.updated_at",
+                        (norm, dump_date),
+                    )
+                    imported += 1
+
+                    if line_no % 2000 == 0:
+                        db.set_state("authors_dump_last_line", str(line_no))
+                        db.commit()
+                        db.begin()
+
+            db.set_state("authors_dump_last_line", str(line_no))
+            db.set_state("authors_dump_completed", "1")
             db.commit()
         except Exception as e:
             db.rollback()
-            QMessageBox.warning(self, "Online import", f"Failed: {e!r}")
+            QMessageBox.warning(self, "Author dump", f"Failed at line {line_no}: {e!r}")
             return
-        QMessageBox.information(self, "Online import", f"Imported/updated {inserted} author(s) into Approved.")
+
+        QMessageBox.information(
+            self,
+            "Author dump",
+            f"Processed dump {os.path.basename(dump_path)}. Imported/updated {imported} author(s); skipped {skipped}."
+        )
         self.refresh()

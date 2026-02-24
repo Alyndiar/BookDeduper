@@ -47,6 +47,7 @@ python main.py
 - Analyze requires a completed scan. Author pre-seeding is a separate Analyze action you can run before full author analysis.
 - Review/Delete requires completed analysis.
 - If 7-Zip is unavailable, archive inner format guessing falls back to filename tags only.
+- Authors tab supports importing approved authors from local Open Library dump files named `ol_dump_authors_YYYY-MM-DD.txt` stored next to the project DB, with resumable progress tracking.
 
 ## Project structure
 
