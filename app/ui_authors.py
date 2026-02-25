@@ -55,7 +55,10 @@ class _ImportDumpWorker(QObject):
                 author_db.set_state("authors_dump_last_line", "0")
 
             with open(dump_path, "r", encoding="utf-8", errors="replace") as fh:
-                for line in fh:
+                while True:
+                    line = fh.readline()
+                    if not line:
+                        break
                     if self._stop:
                         author_db.set_state("authors_dump_last_line", str(line_no))
                         author_db.commit()
