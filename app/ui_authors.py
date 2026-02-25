@@ -2,10 +2,11 @@ from __future__ import annotations
 import os
 import time
 
+from PySide6.QtCore import QObject, QThread, Signal, Qt
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QListWidget, QListWidgetItem,
     QMessageBox, QAbstractItemView, QDialog, QFormLayout, QLineEdit, QTextEdit, QDialogButtonBox,
-    QInputDialog
+    QInputDialog, QProgressDialog
 )
 
 from .util import normalize_text, discover_latest_author_dump_file, parse_author_dump_line
@@ -13,6 +14,191 @@ from .ol_redirects import import_latest_redirect_dump, purge_redirect_table
 
 
 DUMP_PREFIX = "ol_dump_authors_"
+
+
+# ---------------------------------------------------------------------------
+# Background workers for long-running import operations
+# ---------------------------------------------------------------------------
+
+class _ImportDumpWorker(QObject):
+    """Imports an OpenLibrary author dump file in a background thread."""
+    progress = Signal(str, float)   # message, pct  (-1.0 = indeterminate)
+    finished = Signal(bool, str)    # ok, message
+
+    def __init__(self, author_db, dump_path: str, dump_date: str,
+                 start_line: int, restart: bool):
+        super().__init__()
+        self.author_db = author_db
+        self.dump_path = dump_path
+        self.dump_date = dump_date
+        self.start_line = start_line
+        self.restart = restart
+        self._stop = False
+
+    def request_stop(self):
+        self._stop = True
+
+    def run(self):
+        author_db = self.author_db
+        dump_path = self.dump_path
+        dump_date = self.dump_date
+        imported = 0
+        skipped = 0
+        line_no = 0
+        try:
+            file_size = max(1, os.path.getsize(dump_path))
+            author_db.begin()
+            author_db.set_state("authors_dump_completed", "0")
+            author_db.set_state("authors_dump_last_file", dump_path)
+            author_db.set_state("authors_dump_last_date", dump_date)
+            if self.restart:
+                author_db.set_state("authors_dump_last_line", "0")
+
+            with open(dump_path, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if self._stop:
+                        author_db.set_state("authors_dump_last_line", str(line_no))
+                        author_db.commit()
+                        self.finished.emit(False, f"Cancelled at line {line_no}.")
+                        return
+                    line_no += 1
+                    if line_no <= self.start_line:
+                        continue
+                    rec = parse_author_dump_line(line)
+                    if not rec:
+                        skipped += 1
+                        continue
+                    norm = str(rec["canonical_norm"] or "")
+                    if not norm:
+                        skipped += 1
+                        continue
+                    if int(rec.get("token_count") or 0) > 10:
+                        skipped += 1
+                        continue
+                    ol_key = str(rec["ol_key"])
+                    last_modified = str(rec.get("last_modified") or "")
+                    prev = author_db.query_one(
+                        "SELECT last_modified FROM author_dump_records WHERE ol_key=?", (ol_key,))
+                    if prev and str(prev["last_modified"] or "") == last_modified:
+                        skipped += 1
+                        continue
+                    name = str(rec["canonical_name"])
+                    author_db.execute(
+                        "INSERT INTO known_authors(normalized_name,canonical_name,preferred_name,frequency,created_at,updated_at)"
+                        " VALUES(?,?,?,?,strftime('%s','now'),strftime('%s','now'))"
+                        " ON CONFLICT(normalized_name) DO UPDATE SET canonical_name=excluded.canonical_name,"
+                        " preferred_name=excluded.preferred_name, updated_at=excluded.updated_at",
+                        (norm, name, name, 1),
+                    )
+                    author_db.execute(
+                        "INSERT INTO author_dump_imported(normalized_name,dump_date,updated_at)"
+                        " VALUES(?,?,strftime('%s','now'))"
+                        " ON CONFLICT(normalized_name) DO UPDATE SET dump_date=excluded.dump_date, updated_at=excluded.updated_at",
+                        (norm, dump_date),
+                    )
+                    author_db.execute(
+                        "INSERT INTO author_dump_records(ol_key,last_modified,author_norm,canonical_name,dump_date,updated_at)"
+                        " VALUES(?,?,?,?,?,strftime('%s','now')) ON CONFLICT(ol_key) DO UPDATE SET"
+                        " last_modified=excluded.last_modified, author_norm=excluded.author_norm,"
+                        " canonical_name=excluded.canonical_name, dump_date=excluded.dump_date, updated_at=excluded.updated_at",
+                        (ol_key, last_modified, norm, name, dump_date),
+                    )
+                    for alias_norm in list(rec.get("aliases_norm") or []):
+                        author_db.execute(
+                            "INSERT INTO author_aliases(alias_norm,author_norm,author_display,confidence,source,updated_at)"
+                            " VALUES(?,?,?,?,?,strftime('%s','now')) ON CONFLICT(alias_norm) DO UPDATE SET"
+                            " author_norm=excluded.author_norm, author_display=excluded.author_display,"
+                            " confidence=excluded.confidence, source='dump', updated_at=excluded.updated_at",
+                            (alias_norm, norm, alias_norm, 1.0, "dump"),
+                        )
+                    imported += 1
+                    if line_no % 2000 == 0:
+                        pct = min(99.0, 100.0 * fh.tell() / file_size)
+                        self.progress.emit(
+                            f"Line {line_no}: imported {imported}, skipped {skipped}", pct)
+                        author_db.set_state("authors_dump_last_line", str(line_no))
+                        author_db.commit()
+                        author_db.begin()
+
+            author_db.set_state("authors_dump_last_line", str(line_no))
+            author_db.set_state("authors_dump_completed", "1")
+            author_db.commit()
+        except Exception as e:
+            try:
+                author_db.rollback()
+            except Exception:
+                pass
+            self.finished.emit(False, f"Failed at line {line_no}: {e!r}")
+            return
+        self.finished.emit(
+            True,
+            f"Processed {os.path.basename(dump_path)}.\nImported/updated {imported}; skipped {skipped}.",
+        )
+
+
+class _ImportRedirectWorker(QObject):
+    """Imports an OpenLibrary redirect dump file in a background thread."""
+    progress = Signal(str, float)
+    finished = Signal(bool, str)
+
+    def __init__(self, author_db, folder: str):
+        super().__init__()
+        self.author_db = author_db
+        self.folder = folder
+
+    def run(self):
+        self.progress.emit("Importing redirect dump…", -1.0)
+        try:
+            res = import_latest_redirect_dump(self.author_db, self.folder)
+            if res.get("ok"):
+                self.finished.emit(True, str(res.get("message") or "Done."))
+            else:
+                self.finished.emit(False, str(res.get("message") or "Failed."))
+        except Exception as e:
+            self.finished.emit(False, repr(e))
+
+
+class _ImportProgressHandler(QObject):
+    """Holds strong references to slots for import worker progress/finished signals."""
+
+    def __init__(self, tab, thread: QThread, dlg: QProgressDialog, title: str):
+        super().__init__(tab)
+        self._tab = tab
+        self._thread = thread
+        self._dlg = dlg
+        self._title = title
+
+    def on_progress(self, msg: str, pct: float):
+        if pct < 0:
+            self._dlg.setRange(0, 0)
+        else:
+            if self._dlg.maximum() == 0:
+                self._dlg.setRange(0, 100)
+            self._dlg.setValue(int(pct))
+        self._dlg.setLabelText(msg)
+        if self._tab.on_activity_progress:
+            self._tab.on_activity_progress(msg, max(0.0, pct))
+
+    def on_finished(self, ok: bool, msg: str):
+        if self._thread:
+            self._thread.quit()
+            self._thread.wait(5000)
+        self._dlg.close()
+        if self._tab.on_activity_progress:
+            self._tab.on_activity_progress("Idle", -1.0)
+        self._tab._import_thread = None
+        self._tab._import_worker = None
+        self._tab._import_handler = None
+        if ok:
+            QMessageBox.information(self._tab, self._title, msg)
+        else:
+            QMessageBox.warning(self._tab, self._title, msg)
+        self._tab.refresh()
+
+    def on_canceled(self):
+        worker = self._tab._import_worker
+        if worker and hasattr(worker, "request_stop"):
+            worker.request_stop()
 
 
 class AuthorEditDialog(QDialog):
@@ -70,10 +256,14 @@ class AuthorEditDialog(QDialog):
 
 
 class AuthorsTab(QWidget):
-    def __init__(self, get_db, get_author_db):
+    def __init__(self, get_db, get_author_db, on_activity_progress=None):
         super().__init__()
         self.get_db = get_db          # books.db — holds tentative_authors, author_variants, derived aliases
         self.get_author_db = get_author_db  # authors.db — holds known_authors, invalid_authors, OL aliases
+        self.on_activity_progress = on_activity_progress
+        self._import_thread: QThread | None = None
+        self._import_worker = None
+        self._import_handler = None
 
         lay = QVBoxLayout(self)
         self.top = QLabel("Author DB")
@@ -159,6 +349,35 @@ class AuthorsTab(QWidget):
         btns2.addWidget(b_rean)
 
         lay.addLayout(btns2)
+
+    def _start_import_worker(self, worker, title: str):
+        """Start a background import worker with a modal progress dialog."""
+        if self._import_thread and self._import_thread.isRunning():
+            QMessageBox.information(self, title, "An import is already in progress.")
+            return
+
+        thread = QThread()
+        self._import_thread = thread
+        self._import_worker = worker
+
+        dlg = QProgressDialog(title, "Cancel", 0, 100, self)
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setRange(0, 0)   # indeterminate until first progress signal arrives
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+
+        handler = _ImportProgressHandler(self, thread, dlg, title)
+        self._import_handler = handler
+
+        worker.progress.connect(handler.on_progress)
+        worker.finished.connect(handler.on_finished)
+        dlg.canceled.connect(handler.on_canceled)
+
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        thread.start()
+        dlg.show()
 
     def _selected_items(self):
         if self.approved_list.selectedItems():
@@ -449,88 +668,9 @@ class AuthorsTab(QWidget):
             start_line = 0
         elif prev_file and os.path.normcase(prev_file) == os.path.normcase(dump_path):
             start_line = max(0, int(author_db.get_state("authors_dump_last_line", "0") or "0"))
-        else:
-            start_line = 0
 
-        imported = 0
-        skipped = 0
-        line_no = 0
-
-        try:
-            author_db.begin()
-            author_db.set_state("authors_dump_completed", "0")
-            author_db.set_state("authors_dump_last_file", dump_path)
-            author_db.set_state("authors_dump_last_date", dump_date)
-
-            if restart:
-                author_db.set_state("authors_dump_last_line", "0")
-
-            with open(dump_path, "r", encoding="utf-8", errors="replace") as fh:
-                for line in fh:
-                    line_no += 1
-                    if line_no <= start_line:
-                        continue
-                    rec = parse_author_dump_line(line)
-                    if not rec:
-                        skipped += 1
-                        continue
-
-                    norm = str(rec["canonical_norm"] or "")
-                    if not norm:
-                        skipped += 1
-                        continue
-                    if int(rec.get("token_count") or 0) > 10:
-                        skipped += 1
-                        continue
-
-                    ol_key = str(rec["ol_key"])
-                    last_modified = str(rec.get("last_modified") or "")
-                    prev = author_db.query_one("SELECT last_modified FROM author_dump_records WHERE ol_key=?", (ol_key,))
-                    if prev and str(prev["last_modified"] or "") == last_modified:
-                        skipped += 1
-                        continue
-
-                    name = str(rec["canonical_name"])
-                    author_db.execute(
-                        "INSERT INTO known_authors(normalized_name,canonical_name,preferred_name,frequency,created_at,updated_at) VALUES(?,?,?,?,strftime('%s','now'),strftime('%s','now')) ON CONFLICT(normalized_name) DO UPDATE SET canonical_name=excluded.canonical_name, preferred_name=excluded.preferred_name, updated_at=excluded.updated_at",
-                        (norm, name, name, 1),
-                    )
-                    author_db.execute(
-                        "INSERT INTO author_dump_imported(normalized_name,dump_date,updated_at) VALUES(?,?,strftime('%s','now')) ON CONFLICT(normalized_name) DO UPDATE SET dump_date=excluded.dump_date, updated_at=excluded.updated_at",
-                        (norm, dump_date),
-                    )
-                    author_db.execute(
-                        "INSERT INTO author_dump_records(ol_key,last_modified,author_norm,canonical_name,dump_date,updated_at) VALUES(?,?,?,?,?,strftime('%s','now')) ON CONFLICT(ol_key) DO UPDATE SET last_modified=excluded.last_modified, author_norm=excluded.author_norm, canonical_name=excluded.canonical_name, dump_date=excluded.dump_date, updated_at=excluded.updated_at",
-                        (ol_key, last_modified, norm, name, dump_date),
-                    )
-
-                    for alias_norm in list(rec.get("aliases_norm") or []):
-                        author_db.execute(
-                            "INSERT INTO author_aliases(alias_norm,author_norm,author_display,confidence,source,updated_at) VALUES(?,?,?,?,?,strftime('%s','now')) ON CONFLICT(alias_norm) DO UPDATE SET author_norm=excluded.author_norm, author_display=excluded.author_display, confidence=excluded.confidence, source='dump', updated_at=excluded.updated_at",
-                            (alias_norm, norm, alias_norm, 1.0, "dump"),
-                        )
-
-                    imported += 1
-
-                    if line_no % 2000 == 0:
-                        author_db.set_state("authors_dump_last_line", str(line_no))
-                        author_db.commit()
-                        author_db.begin()
-
-            author_db.set_state("authors_dump_last_line", str(line_no))
-            author_db.set_state("authors_dump_completed", "1")
-            author_db.commit()
-        except Exception as e:
-            author_db.rollback()
-            QMessageBox.warning(self, "Author dump", f"Failed at line {line_no}: {e!r}")
-            return
-
-        QMessageBox.information(
-            self,
-            "Author dump",
-            f"Processed dump {os.path.basename(dump_path)}. Imported/updated {imported} author(s); skipped {skipped}."
-        )
-        self.refresh()
+        worker = _ImportDumpWorker(author_db, dump_path, dump_date, start_line, restart)
+        self._start_import_worker(worker, "Author dump import")
 
     def import_redirect_dump(self):
         author_db = self.get_author_db()
@@ -538,12 +678,8 @@ class AuthorsTab(QWidget):
             QMessageBox.warning(self, "Redirect dump", "No author DB connected.")
             return
         folder = os.path.dirname(author_db.db_path) or os.getcwd()
-        res = import_latest_redirect_dump(author_db, folder)
-        if not res.get("ok"):
-            QMessageBox.warning(self, "Redirect dump", str(res.get("message") or "Failed."))
-            return
-        QMessageBox.information(self, "Redirect dump", str(res.get("message") or "Done."))
-        self.refresh()
+        worker = _ImportRedirectWorker(author_db, folder)
+        self._start_import_worker(worker, "Redirect dump import")
 
     def purge_redirects(self):
         author_db = self.get_author_db()

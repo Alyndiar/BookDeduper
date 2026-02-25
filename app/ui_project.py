@@ -56,10 +56,11 @@ class _OpenProjectWorker(QObject):
 
 
 class ProjectTab(QWidget):
-    def __init__(self, on_project_opened, on_activity_progress=None):
+    def __init__(self, on_project_opened, on_activity_progress=None, on_author_db_opened=None):
         super().__init__()
         self.on_project_opened = on_project_opened
         self.on_activity_progress = on_activity_progress
+        self.on_author_db_opened = on_author_db_opened
 
         lay = QVBoxLayout(self)
         self.info = QLabel("Open or create a project (books.sqlite) and link an author DB (authors.sqlite).")
@@ -94,6 +95,11 @@ class ProjectTab(QWidget):
         self.btn_author_new = QPushButton("New…")
         self.btn_author_new.clicked.connect(self.new_author_db)
         arow.addWidget(self.btn_author_new)
+        self.btn_author_standalone = QPushButton("Open Standalone")
+        self.btn_author_standalone.setToolTip(
+            "Open just the Author DB without a project DB — enables the Authors tab immediately")
+        self.btn_author_standalone.clicked.connect(self.open_author_only)
+        arow.addWidget(self.btn_author_standalone)
         lay.addLayout(arow)
 
         lay.addWidget(QLabel("Settings stored in project DB state:"))
@@ -180,6 +186,7 @@ class ProjectTab(QWidget):
         self.btn_browse.setEnabled(enabled)
         self.btn_author_browse.setEnabled(enabled)
         self.btn_author_new.setEnabled(enabled)
+        self.btn_author_standalone.setEnabled(enabled)
 
     def _read_custom_cfg_from_ui(self) -> dict:
         def _ival(edit: QLineEdit, dflt: int) -> int:
@@ -239,6 +246,28 @@ class ProjectTab(QWidget):
         if not fn.lower().endswith(".sqlite"):
             fn += ".sqlite"
         self.author_path_edit.setText(fn)
+
+    def open_author_only(self):
+        """Open just the author DB (no project DB required) and notify MainWindow."""
+        path = self.author_path_edit.text().strip()
+        if not path:
+            fn, _ = QFileDialog.getOpenFileName(
+                self, "Open author DB", "", "SQLite DB (*.sqlite *.db);;All files (*.*)")
+            if not fn:
+                return
+            self.author_path_edit.setText(fn)
+            path = fn
+        try:
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            author_db = AuthorDB(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Author DB", f"Failed to open:\n{e!r}")
+            return
+        self.info.setText(f"Author DB opened standalone: {os.path.basename(path)}")
+        if self.on_author_db_opened:
+            self.on_author_db_opened(author_db)
 
     def open_project(self, create: bool = False):
         _ = create
