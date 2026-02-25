@@ -317,16 +317,31 @@ def parse_filename(name: str, known_authors: Optional[Dict[str, Dict[str, Any]]]
         trace.append("no_separator")
 
     elif len(parts) == 2:
-        # Single " - " separator: Author - Title
-        m = STRICT_RE.match(stem)
-        if m:
-            author = (m.group("author") or "").strip()
-            title = (m.group("title") or "").strip()
-            trace.append("strict_two_part")
-        else:
+        # Single " - " separator: conventionally Author - Title, but check both ends.
+        valid_first, score_first, _ = _is_name_like(parts[0])
+        valid_last, score_last, _ = _is_name_like(parts[1])
+        first_qualifies = valid_first and score_first >= MULTI_PART_AUTHOR_THRESHOLD
+        last_qualifies = valid_last and score_last >= MULTI_PART_AUTHOR_THRESHOLD
+
+        if last_qualifies and score_last > score_first + MULTI_PART_FIRST_MARGIN:
+            # Last part is notably more name-like — reversed ordering (Title - Author)
+            author = parts[1]
+            title = parts[0]
+            trace.append("two_part_reversed")
+        elif first_qualifies:
+            # Conventional ordering, or both qualify with similar scores → prefer first
             author = parts[0]
             title = parts[1]
-            trace.append("two_part_split")
+            trace.append("two_part")
+        elif last_qualifies:
+            # First doesn't reach threshold but last does (within the margin)
+            author = parts[1]
+            title = parts[0]
+            trace.append("two_part_reversed")
+        else:
+            # Neither end is confidently a name — leave author Unknown
+            title = parts[1]
+            trace.append("two_part_uncertain")
 
     else:
         # Two or more " - " separators: Author - Series[/index] - Title
