@@ -124,7 +124,10 @@ def import_latest_redirect_dump(
         db.begin()
         line_no = 0
         with open(dump_file, "r", encoding="utf-8", errors="replace") as fh:
-            for line in fh:
+            while True:
+                line = fh.readline()
+                if not line:
+                    break
                 line_no += 1
                 if line_no <= start_line:
                     continue
