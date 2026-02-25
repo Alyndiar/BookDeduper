@@ -158,3 +158,39 @@ def extract_author_name_from_dump_line(line: str) -> str:
 def is_single_token_name(norm: str) -> bool:
     tokens = [t for t in norm.split() if t]
     return len(tokens) <= 1
+
+
+def read_epub_metadata(path: str) -> dict:
+    """Read author and title from an EPUB's OPF metadata. Returns {} on any error."""
+    import zipfile
+    import xml.etree.ElementTree as ET
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            try:
+                container_data = zf.read("META-INF/container.xml")
+            except KeyError:
+                return {}
+            root = ET.fromstring(container_data)
+            ns = {"c": "urn:oasis:names:tc:opendocument:xmlns:container"}
+            rootfile_el = root.find(".//c:rootfile", ns)
+            if rootfile_el is None:
+                return {}
+            opf_path = rootfile_el.get("full-path")
+            if not opf_path:
+                return {}
+            try:
+                opf_data = zf.read(opf_path)
+            except KeyError:
+                return {}
+            opf_root = ET.fromstring(opf_data)
+            DC = "http://purl.org/dc/elements/1.1/"
+            creator_el = opf_root.find(f".//{{{DC}}}creator")
+            title_el = opf_root.find(f".//{{{DC}}}title")
+            result = {}
+            if creator_el is not None and creator_el.text:
+                result["author"] = creator_el.text.strip()
+            if title_el is not None and title_el.text:
+                result["title"] = title_el.text.strip()
+            return result
+    except Exception:
+        return {}
