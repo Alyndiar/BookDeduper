@@ -145,11 +145,21 @@ class _ImportRedirectWorker(QObject):
         super().__init__()
         self.author_db = author_db
         self.folder = folder
+        self._stop = False
+
+    def request_stop(self):
+        self._stop = True
 
     def run(self):
-        self.progress.emit("Importing redirect dump…", -1.0)
+        def _cb(msg: str, pct: float):
+            self.progress.emit(msg, pct)
+
         try:
-            res = import_latest_redirect_dump(self.author_db, self.folder)
+            res = import_latest_redirect_dump(
+                self.author_db, self.folder,
+                progress_cb=_cb,
+                stop_fn=lambda: self._stop,
+            )
             if res.get("ok"):
                 self.finished.emit(True, str(res.get("message") or "Done."))
             else:
