@@ -38,7 +38,7 @@ class MainWindow(QMainWindow):
         self.roots_tab = RootsTab(get_db=lambda: self.db)
         self.scan_tab = ScanTab(get_db=lambda: self.db, get_author_db=lambda: self.author_db, on_scan_completed=self.on_scan_completed, on_activity_progress=self.on_activity_progress)
         self.analyze_tab = AnalyzeTab(get_db=lambda: self.db, get_author_db=lambda: self.author_db, on_analyze_completed=self.on_analyze_completed, on_activity_progress=self.on_activity_progress)
-        self.review_tab = ReviewTab(get_db=lambda: self.db, get_author_db=lambda: self.author_db)
+        self.review_tab = ReviewTab(get_db=lambda: self.db, get_author_db=lambda: self.author_db, on_activity_progress=self.on_activity_progress)
         self.authors_tab = AuthorsTab(get_db=lambda: self.db, get_author_db=lambda: self.author_db, on_activity_progress=self.on_activity_progress)
 
         self.tabs.addTab(self.project_tab, "1) Project")

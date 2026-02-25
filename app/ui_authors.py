@@ -211,6 +211,65 @@ class _ImportProgressHandler(QObject):
             worker.request_stop()
 
 
+# ---------------------------------------------------------------------------
+# Background worker for loading author lists
+# ---------------------------------------------------------------------------
+
+class _AuthorRefreshWorker(QObject):
+    """Loads the three author lists from DB in a background thread."""
+    finished = Signal(object)   # tuple (approved, tentative, invalid) of list[dict], or None on error
+
+    def __init__(self, db, author_db):
+        super().__init__()
+        self.db = db
+        self.author_db = author_db
+
+    def run(self):
+        try:
+            approved = []
+            invalid = []
+            tentative = []
+            if self.author_db:
+                approved = [dict(r) for r in self.author_db.query_all(
+                    "SELECT normalized_name, COALESCE(preferred_name, canonical_name) AS shown,"
+                    " canonical_name, frequency FROM known_authors ORDER BY frequency DESC, canonical_name"
+                )]
+                invalid = [dict(r) for r in self.author_db.query_all(
+                    "SELECT normalized_name, canonical_name FROM invalid_authors ORDER BY canonical_name"
+                )]
+            if self.db:
+                tentative = [dict(r) for r in self.db.query_all(
+                    "SELECT normalized_name, COALESCE(preferred_name, canonical_name) AS shown,"
+                    " canonical_name, frequency, confidence FROM tentative_authors"
+                    " ORDER BY frequency DESC, canonical_name"
+                )]
+            self.finished.emit((approved, tentative, invalid))
+        except Exception:
+            self.finished.emit(None)
+
+
+class _AuthorRefreshHandler(QObject):
+    """Holds a strong reference to the _AuthorRefreshWorker.finished slot."""
+
+    def __init__(self, tab, thread: QThread):
+        super().__init__(tab)
+        self._tab = tab
+        self._thread = thread
+
+    def on_finished(self, result):
+        if self._thread:
+            self._thread.quit()
+            self._thread.wait(5000)
+        self._tab._refresh_thread = None
+        self._tab._refresh_worker = None
+        self._tab._refresh_handler = None
+        if result is not None:
+            approved, tentative, invalid = result
+            self._tab._populate_authors(approved, tentative, invalid)
+        if self._tab.on_activity_progress:
+            self._tab.on_activity_progress("Idle", -1.0)
+
+
 class AuthorEditDialog(QDialog):
     def __init__(self, parent, title: str, canonical: str, preferred: str, confidence: float, aliases: list[tuple[str, float]]):
         super().__init__(parent)
@@ -274,6 +333,9 @@ class AuthorsTab(QWidget):
         self._import_thread: QThread | None = None
         self._import_worker = None
         self._import_handler = None
+        self._refresh_thread: QThread | None = None
+        self._refresh_worker = None
+        self._refresh_handler = None
 
         lay = QVBoxLayout(self)
         self.top = QLabel("Author DB")
@@ -399,21 +461,35 @@ class AuthorsTab(QWidget):
         return None, []
 
     def refresh(self):
-        db = self.get_db()
-        author_db = self.get_author_db()
+        """Start a background refresh of all three author lists."""
+        # If an import is already running, skip — the import handler will call refresh() when done.
+        if self._import_thread and self._import_thread.isRunning():
+            return
+        # If a refresh is already in-flight, skip it — the existing one will finish shortly.
+        if self._refresh_thread and self._refresh_thread.isRunning():
+            return
+
+        if self.on_activity_progress:
+            self.on_activity_progress("Loading authors…", -1.0)
+
+        thread = QThread()
+        worker = _AuthorRefreshWorker(self.get_db(), self.get_author_db())
+        handler = _AuthorRefreshHandler(self, thread)
+
+        self._refresh_thread = thread
+        self._refresh_worker = worker
+        self._refresh_handler = handler
+
+        worker.finished.connect(handler.on_finished)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        thread.start()
+
+    def _populate_authors(self, approved: list, tentative: list, invalid: list):
+        """Populate the three list widgets from the already-loaded row dicts (main thread)."""
         self.approved_list.clear()
         self.tentative_list.clear()
         self.invalid_list.clear()
-
-        approved = []
-        invalid = []
-        if author_db:
-            approved = author_db.query_all("SELECT normalized_name, COALESCE(preferred_name, canonical_name) AS shown, canonical_name, frequency FROM known_authors ORDER BY frequency DESC, canonical_name")
-            invalid = author_db.query_all("SELECT normalized_name, canonical_name FROM invalid_authors ORDER BY canonical_name")
-
-        tentative = []
-        if db:
-            tentative = db.query_all("SELECT normalized_name, COALESCE(preferred_name, canonical_name) AS shown, canonical_name, frequency, confidence FROM tentative_authors ORDER BY frequency DESC, canonical_name")
 
         for r in approved:
             it = QListWidgetItem(f"{r['shown']} ({int(r['frequency'] or 0)})")
@@ -428,7 +504,7 @@ class AuthorsTab(QWidget):
             it.setData(256, (r["normalized_name"], r["canonical_name"], r["canonical_name"], 0.0))
             self.invalid_list.addItem(it)
 
-        no_author_db = " (no authors.db)" if not author_db else ""
+        no_author_db = " (no authors.db)" if not self.get_author_db() else ""
         self.top.setText(f"Author DB{no_author_db}: approved={len(approved)} tentative={len(tentative)} invalid={len(invalid)}")
 
     def _aliases_for(self, norm: str) -> list[tuple[str, float]]:
@@ -631,20 +707,29 @@ class AuthorsTab(QWidget):
         db = self.get_db()
         if QMessageBox.question(self, "Clear authors", f"Clear {which} authors?") != QMessageBox.Yes:
             return
+        if self.on_activity_progress:
+            self.on_activity_progress(f"Clearing {which} authors…", -1.0)
         if which == "approved":
             if not author_db:
                 QMessageBox.warning(self, "Authors", "No author DB connected.")
+                if self.on_activity_progress:
+                    self.on_activity_progress("Idle", -1.0)
                 return
             author_db.execute("DELETE FROM known_authors")
         elif which == "invalid":
             if not author_db:
                 QMessageBox.warning(self, "Authors", "No author DB connected.")
+                if self.on_activity_progress:
+                    self.on_activity_progress("Idle", -1.0)
                 return
             author_db.execute("DELETE FROM invalid_authors")
         elif which == "tentative":
             if not db:
+                if self.on_activity_progress:
+                    self.on_activity_progress("Idle", -1.0)
                 return
             db.execute("DELETE FROM tentative_authors")
+        # refresh() will set "Idle" via _AuthorRefreshHandler when the worker finishes.
         self.refresh()
 
     def mark_reanalyze(self):
