@@ -34,12 +34,12 @@ class MainWindow(QMainWindow):
 
         self.tabs = QTabWidget()
         self.tabs.setTabsClosable(False)
-        self.project_tab = ProjectTab(on_project_opened=self.on_project_opened, on_activity_progress=self.on_activity_progress)
+        self.project_tab = ProjectTab(on_project_opened=self.on_project_opened, on_activity_progress=self.on_activity_progress, on_author_db_opened=self.on_author_db_opened_standalone)
         self.roots_tab = RootsTab(get_db=lambda: self.db)
         self.scan_tab = ScanTab(get_db=lambda: self.db, get_author_db=lambda: self.author_db, on_scan_completed=self.on_scan_completed, on_activity_progress=self.on_activity_progress)
         self.analyze_tab = AnalyzeTab(get_db=lambda: self.db, get_author_db=lambda: self.author_db, on_analyze_completed=self.on_analyze_completed, on_activity_progress=self.on_activity_progress)
-        self.review_tab = ReviewTab(get_db=lambda: self.db, get_author_db=lambda: self.author_db)
-        self.authors_tab = AuthorsTab(get_db=lambda: self.db, get_author_db=lambda: self.author_db)
+        self.review_tab = ReviewTab(get_db=lambda: self.db, get_author_db=lambda: self.author_db, on_activity_progress=self.on_activity_progress)
+        self.authors_tab = AuthorsTab(get_db=lambda: self.db, get_author_db=lambda: self.author_db, on_activity_progress=self.on_activity_progress)
 
         self.tabs.addTab(self.project_tab, "1) Project")
         self.tabs.addTab(self.roots_tab, "2) Roots")
@@ -188,19 +188,24 @@ class MainWindow(QMainWindow):
             return 0
 
     def _collect_stats(self) -> dict:
-        if not self.db:
+        if not self.db and not self.author_db:
             return {}
-        files = self._safe_i(self.db.query_one("SELECT COUNT(*) AS c FROM files"), "c")
-        folders = self._safe_i(self.db.query_one("SELECT COUNT(*) AS c FROM folders"), "c")
+        files = 0
+        folders = 0
+        dup_found = None
+        dup_todo = None
+        if self.db:
+            files = self._safe_i(self.db.query_one("SELECT COUNT(*) AS c FROM files"), "c")
+            folders = self._safe_i(self.db.query_one("SELECT COUNT(*) AS c FROM folders"), "c")
+            dup_found = self.db.query_one(
+                "SELECT COUNT(*) AS files, COUNT(DISTINCT work_key) AS groups FROM deletion_queue"
+            )
+            dup_todo = self.db.query_one(
+                "SELECT COUNT(*) AS files, COUNT(DISTINCT work_key) AS groups FROM deletion_queue WHERE checked=1"
+            )
         authors = 0
         if self.author_db:
             authors = self._safe_i(self.author_db.query_one("SELECT COUNT(*) AS c FROM known_authors"), "c")
-        dup_found = self.db.query_one(
-            "SELECT COUNT(*) AS files, COUNT(DISTINCT work_key) AS groups FROM deletion_queue"
-        )
-        dup_todo = self.db.query_one(
-            "SELECT COUNT(*) AS files, COUNT(DISTINCT work_key) AS groups FROM deletion_queue WHERE checked=1"
-        )
         return {
             "files": files,
             "folders": folders,
@@ -300,6 +305,21 @@ class MainWindow(QMainWindow):
         self.refresh_all_statuses()
 
         self.tabs.setCurrentIndex(1)
+
+    def on_author_db_opened_standalone(self, author_db: AuthorDB):
+        """Called when the user opens just an author DB without a project DB."""
+        if self.author_db and self.author_db is not author_db:
+            try:
+                self.author_db.remove_io_callback(self._io_callback)
+                self.author_db.close()
+            except Exception:
+                pass
+        self.author_db = author_db
+        self.author_db.add_io_callback(self._io_callback)
+        self.tabs.setTabEnabled(5, True)
+        self.authors_tab.refresh()
+        self.tabs.setCurrentIndex(5)
+        self.refresh_all_statuses()
 
     def on_scan_completed(self, ok: bool):
         if not self.db:

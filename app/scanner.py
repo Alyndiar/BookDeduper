@@ -7,8 +7,8 @@ from typing import List, Optional, Dict, Tuple
 from PySide6.QtCore import QObject, Signal
 from .db import DB
 from .author_db import AuthorDB
-from .util import norm_path, file_sig_from_stat, ext_of, is_probably_archive, dumps, loads, now_ts, normalize_text
-from .parser import parse_filename, detect_quality_tags, make_work_key
+from .util import norm_path, file_sig_from_stat, ext_of, is_probably_archive, dumps, loads, now_ts, normalize_text, read_epub_metadata
+from .parser import parse_filename, detect_quality_tags, make_work_key, normalize_author_display
 from .sevenzip import detect_7z, list_archive_exts
 
 logger = logging.getLogger(__name__)
@@ -252,6 +252,38 @@ class ScanWorker(QObject):
             )
 
 
+    def _update_parsed_in_db(self, path: str, parsed) -> None:
+        """Update files and works records after LLM enrichment."""
+        series_index_norm = self._series_index_norm(parsed.series_index)
+        self.db.execute(
+            """UPDATE files SET
+                 author=?, series=?, series_index=?, title=?, tags=?,
+                 author_norm=?, series_norm=?, title_norm=?, work_key=?
+               WHERE path=?""",
+            (
+                parsed.author, parsed.series, parsed.series_index, parsed.title,
+                " | ".join(parsed.tags),
+                parsed.author_norm, parsed.series_norm, parsed.title_norm, parsed.work_key,
+                path,
+            ),
+        )
+        self.db.execute(
+            """INSERT INTO works(
+                 work_key, author_norm, series_norm, series_index_norm, title_norm,
+                 display_author, display_series, display_series_index, display_title
+               ) VALUES(?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(work_key) DO UPDATE SET
+                 author_norm=excluded.author_norm,
+                 series_norm=excluded.series_norm,
+                 series_index_norm=excluded.series_index_norm,
+                 title_norm=excluded.title_norm""",
+            (
+                parsed.work_key, parsed.author_norm, parsed.series_norm,
+                series_index_norm, parsed.title_norm,
+                parsed.author, parsed.series or "", str(parsed.series_index or ""), parsed.title,
+            ),
+        )
+
     def _run_scan(self) -> Tuple[bool, str]:
         roots_rows = self.db.query_all("SELECT id,path FROM roots WHERE enabled=1 ORDER BY id")
         roots = [r["path"] for r in roots_rows]
@@ -276,6 +308,7 @@ class ScanWorker(QObject):
         last_checkpoint_time = time.time()
         current_dir = ""
         last_path = ""
+        llm_pending: list = []  # (path, stem, Parsed) triples queued for LLM enrichment
 
         root_pairs = sorted(
             ((norm_path(r["path"]), int(r["id"])) for r in roots_rows),
@@ -352,8 +385,33 @@ class ScanWorker(QObject):
 
                             stats["files_changed"] += 1
 
+                            # Tier 1: Filename parsing (always primary — trusted over metadata)
                             parsed = parse_filename(name)
-                            self._try_correct_author(parsed, name, author_aliases)
+
+                            # Tier 2: EPUB in-file metadata — only when filename parse was low-confidence
+                            if parsed.needs_llm and ext.lower() == "epub":
+                                epub_meta = read_epub_metadata(p)
+                                if epub_meta:
+                                    if epub_meta.get("author"):
+                                        parsed.author = normalize_author_display(epub_meta["author"])
+                                        parsed.author_norm = normalize_text(parsed.author)
+                                        parsed.author_confidence = 0.90
+                                        parsed.author_reason = "epub_metadata"
+                                        parsed.needs_llm = False
+                                    if epub_meta.get("title"):
+                                        parsed.title = epub_meta["title"]
+                                        parsed.title_norm = normalize_text(parsed.title)
+
+                            # Tier 3: alias correction for still-unknown authors
+                            corrected = self._try_correct_author(parsed, name, author_aliases)
+                            if corrected:
+                                parsed.needs_llm = False
+
+                            # Queue for LLM if still low-confidence after all heuristics
+                            if parsed.needs_llm:
+                                stem = name.rsplit(".", 1)[0] if "." in name else name
+                                llm_pending.append((p, stem, parsed))
+
                             ts_now = now_ts()
                             self._learn_author_alias(parsed, author_aliases, ts_now)
                             tags_lower = detect_quality_tags(parsed.tags)
@@ -483,6 +541,23 @@ class ScanWorker(QObject):
         except Exception:
             self.db.rollback()
             raise
+
+        # LLM enrichment pass — runs after the main scan commits, before status is finalised
+        if llm_pending and not self._stop:
+            from .llm import enrich_with_llm
+            self.progress.emit(f"LLM enrichment queued for {len(llm_pending)} files...")
+            enrich_with_llm(llm_pending, progress_cb=self.progress.emit)
+            enriched = [(path, parsed) for path, _, parsed in llm_pending if not parsed.needs_llm]
+            if enriched:
+                self.db.begin()
+                try:
+                    for path, parsed in enriched:
+                        self._update_parsed_in_db(path, parsed)
+                    self.db.commit()
+                except Exception:
+                    self.db.rollback()
+            stats["llm_pending"] = len(llm_pending)
+            stats["llm_enriched"] = len(enriched)
 
         if self._stop:
             self._set_scan_status(scan_id, "aborted")

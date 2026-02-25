@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "BookDeduper",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["main.py"],
+      "port": 0
+    },
+    {
+      "name": "KoboldCpp LLM",
+      "runtimeExecutable": "koboldcpp",
+      "runtimeArgs": ["--usecublas", "--port", "5001"],
+      "port": 5001
+    }
+  ]
+}

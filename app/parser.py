@@ -18,19 +18,39 @@ STRICT_RE = re.compile(
     r"""
     ^\s*
     (?P<author>.+?)
-    (?:\s*-\s*\[(?P<series>.+?)\s+(?P<series_index>\d+(?:\.\d+)?)\])?
-    \s*-\s*
+    (?:[ ]+-[ ]+\[(?P<series>.+?)\s+(?P<series_index>\d+(?:\.\d+)?)\])?
+    [ ]+-[ ]+
     (?P<title>.+?)
     \s*$
     """,
     re.VERBOSE
 )
 
+LLM_CONFIDENCE_THRESHOLD = 0.65  # files below this confidence are queued for LLM enrichment
+
+# Multi-part split thresholds (Author - Series - Title case)
+# Derived from _is_name_like scoring:
+#   clean 2-token name:            0.5 + 2×0.02          = 0.54
+#   article-led string ("The …"): 0.5 − 0.12 + n×0.02  ≤ 0.44
+# 0.45 sits cleanly between those two bands.
+MULTI_PART_AUTHOR_THRESHOLD = 0.45
+# Last segment must beat first by this margin to override the conventional Author-first order.
+MULTI_PART_FIRST_MARGIN = 0.10
+
 STOPWORDS = {
     "volume", "vol", "book", "series", "edition", "part", "tome", "integrale", "complete", "collection"
 }
 TITLE_LEAD_WORDS = {"the", "a", "an"}
 TAG_WORDS = {"retail", "ocr", "scan", "fixed", "v2", "v3", "v4", "v5"}
+# Words that appear in sentences but never in author names; any hit signals a sentence fragment.
+SENTENCE_WORDS = {
+    "is", "are", "was", "were", "be", "been", "being",
+    "has", "have", "had", "do", "does", "did",
+    "will", "would", "could", "should", "may", "might", "shall", "can",
+    "this", "that", "these", "those",
+    "he", "she", "they", "we", "you", "it",
+    "his", "her", "their", "our", "your", "its",
+}
 DASH_SEPS = [" - ", " – ", " — "]
 
 _SUFFIX_CANON = {
@@ -76,6 +96,7 @@ class Parsed:
     author_confidence: float = 0.0
     author_reason: str = ""
     author_trace: str = ""
+    needs_llm: bool = False
 
 
 def _strip_accents(s: str) -> str:
@@ -136,9 +157,17 @@ def _is_name_like(text: str) -> Tuple[bool, float, List[str]]:
     norm = normalize_text(cleaned)
     tokens = [t for t in norm.split() if t]
     reasons: List[str] = []
+
+    if tokens and tokens[0][0].isdigit():
+        return False, 0.0, ["leading_number"]
+
     if not (2 <= len(tokens) <= 5):
         reasons.append("token_count")
     score = 0.5
+
+    if any(t in SENTENCE_WORDS for t in tokens):
+        score -= 0.4
+        reasons.append("sentence_word")
 
     if any(t in STOPWORDS for t in tokens):
         score -= 0.25
@@ -214,6 +243,13 @@ def extract_author_candidates(stem: str, known_authors: Optional[Dict[str, Dict[
             break
 
     if len(candidates) == 0:
+        # "Something by Author Name" — common informal naming when no " - " separator exists
+        m_by = re.search(r"(?<!\w)by(?!\w)", s, re.IGNORECASE)
+        if m_by:
+            right = s[m_by.end():].strip()
+            if right:
+                _add_candidate(candidates, right, 0.78, "by_separator")
+
         for part in re.split(r"[\-–—]", s):
             part = part.strip()
             if part:
@@ -273,40 +309,106 @@ def parse_filename(name: str, known_authors: Optional[Dict[str, Dict[str, Any]]]
     title = stem.strip()
     trace: List[str] = []
 
-    m = STRICT_RE.match(stem)
-    if m:
-        author = (m.group("author") or "").strip()
-        title = (m.group("title") or "").strip()
-        if m.group("series"):
-            series = m.group("series").strip()
-        if m.group("series_index"):
-            try:
-                series_index = float(m.group("series_index"))
-            except Exception:
-                series_index = None
-        trace.append("strict_pattern_match")
-    else:
-        parts = [p.strip() for p in stem.split(" - ") if p.strip()]
-        if len(parts) >= 2:
+    parts = [p.strip() for p in stem.split(" - ") if p.strip()]
+
+    if len(parts) == 1:
+        # No " - " separator — whole stem is the title, author unknown
+        title = parts[0]
+        trace.append("no_separator")
+
+    elif len(parts) == 2:
+        # Single " - " separator: conventionally Author - Title, but check both ends.
+        valid_first, score_first, _ = _is_name_like(parts[0])
+        valid_last, score_last, _ = _is_name_like(parts[1])
+        first_qualifies = valid_first and score_first >= MULTI_PART_AUTHOR_THRESHOLD
+        last_qualifies = valid_last and score_last >= MULTI_PART_AUTHOR_THRESHOLD
+
+        if last_qualifies and score_last > score_first + MULTI_PART_FIRST_MARGIN:
+            # Last part is notably more name-like — reversed ordering (Title - Author)
+            author = parts[1]
+            title = parts[0]
+            trace.append("two_part_reversed")
+        elif first_qualifies:
+            # Conventional ordering, or both qualify with similar scores → prefer first
             author = parts[0]
-            title = parts[-1]
-            mid = " - ".join(parts[1:-1]).strip() if len(parts) > 2 else ""
-            sm = re.search(r"\[(.+?)\s+(\d+(?:\.\d+)?)\]", mid)
-            if sm:
-                series = sm.group(1).strip()
+            title = parts[1]
+            trace.append("two_part")
+        elif last_qualifies:
+            # First doesn't reach threshold but last does (within the margin)
+            author = parts[1]
+            title = parts[0]
+            trace.append("two_part_reversed")
+        else:
+            # Neither end is confidently a name — leave author Unknown
+            title = parts[1]
+            trace.append("two_part_uncertain")
+
+    else:
+        # Two or more " - " separators: Author - Series[/index] - Title
+        # Most probable format regardless of whether series has brackets or a number.
+        # Try STRICT_RE first — only matches when series is [bracketed with number].
+        m = STRICT_RE.match(stem)
+        if m and m.group("series"):
+            author = (m.group("author") or "").strip()
+            title = (m.group("title") or "").strip()
+            series = m.group("series").strip()
+            if m.group("series_index"):
                 try:
-                    series_index = float(sm.group(2))
+                    series_index = float(m.group("series_index"))
                 except Exception:
                     series_index = None
+            trace.append("strict_bracketed_series")
+        else:
+            # Plain format: Author - Series[/index] - Title.
+            # Score both ends and prefer whichever looks more like a name, with a
+            # bias toward the first part to respect the conventional Author-first order.
+            series_raw = " - ".join(parts[1:-1])
+            valid_first, score_first, _ = _is_name_like(parts[0])
+            valid_last, score_last, _ = _is_name_like(parts[-1])
+            first_qualifies = valid_first and score_first >= MULTI_PART_AUTHOR_THRESHOLD
+            last_qualifies = valid_last and score_last >= MULTI_PART_AUTHOR_THRESHOLD
+
+            if last_qualifies and score_last > score_first + MULTI_PART_FIRST_MARGIN:
+                # Last part is notably more name-like — reversed ordering (Title - Series - Author)
+                author = parts[-1]
+                title = parts[0]
+                trace.append("multi_part_series_reversed")
+            elif first_qualifies:
+                # Conventional ordering, or both qualify with similar scores → prefer first
+                author = parts[0]
+                title = parts[-1]
+                trace.append("multi_part_series")
+            elif last_qualifies:
+                # First doesn't reach threshold but last does (within the margin)
+                author = parts[-1]
+                title = parts[0]
+                trace.append("multi_part_series_reversed")
             else:
-                sm2 = re.search(r"(.+?)\s+(\d+(?:\.\d+)?)$", mid)
-                if sm2:
-                    series = sm2.group(1).strip()
+                # Neither end is confidently a name — uncertain ordering
+                author = "Unknown"
+                title = parts[-1]
+                series = series_raw if series_raw else None
+                trace.append("multi_part_uncertain")
+
+            # Extract series name and optional index from the middle segment
+            if author != "Unknown":
+                sm = re.search(r"\[(.+?)\s+(\d+(?:\.\d+)?)\]", series_raw)
+                if sm:
+                    series = sm.group(1).strip()
                     try:
-                        series_index = float(sm2.group(2))
+                        series_index = float(sm.group(2))
                     except Exception:
                         series_index = None
-        trace.append("legacy_fallback")
+                else:
+                    sm2 = re.search(r"^(.+?)\s+(\d+(?:\.\d+)?)$", series_raw)
+                    if sm2:
+                        series = sm2.group(1).strip()
+                        try:
+                            series_index = float(sm2.group(2))
+                        except Exception:
+                            series_index = None
+                    else:
+                        series = series_raw  # plain series name, no number
 
     candidates = extract_author_candidates(stem, known_authors=known_authors, invalid_authors=invalid_authors)
     chosen_conf = 0.35
@@ -336,7 +438,8 @@ def parse_filename(name: str, known_authors: Optional[Dict[str, Dict[str, Any]]]
     work_key = make_work_key(author_norm, series_norm, title_norm, series_index_norm)
 
     trace_text = " | ".join(trace)
-    logger.debug("parse_filename name=%s author=%s conf=%.2f reason=%s trace=%s", name, author, chosen_conf, chosen_reason, trace_text)
+    needs_llm = author_norm == "unknown" or chosen_conf < LLM_CONFIDENCE_THRESHOLD
+    logger.debug("parse_filename name=%s author=%s conf=%.2f reason=%s needs_llm=%s trace=%s", name, author, chosen_conf, chosen_reason, needs_llm, trace_text)
 
     return Parsed(
         author=author,
@@ -351,6 +454,7 @@ def parse_filename(name: str, known_authors: Optional[Dict[str, Dict[str, Any]]]
         author_confidence=chosen_conf,
         author_reason=chosen_reason,
         author_trace=trace_text,
+        needs_llm=needs_llm,
     )
 
 

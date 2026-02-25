@@ -1,17 +1,100 @@
 from __future__ import annotations
+import os
+
+from PySide6.QtCore import QObject, QThread, Signal, Qt
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QListWidget, QListWidgetItem,
-    QTableWidget, QTableWidgetItem, QMessageBox, QCheckBox, QDialog, QDialogButtonBox, QTextEdit
+    QTableWidget, QTableWidgetItem, QMessageBox, QCheckBox, QDialog, QDialogButtonBox, QTextEdit,
+    QProgressDialog,
 )
-from PySide6.QtCore import Qt
+
 from .deleter import delete_checked
 
+
+# ---------------------------------------------------------------------------
+# Background worker for file deletion
+# ---------------------------------------------------------------------------
+
+class _DeleteWorker(QObject):
+    """Sends checked files to the Recycle Bin in a background thread."""
+    progress = Signal(str, float)           # message, pct in [0, 100]
+    finished = Signal(bool, str, int, int)  # ok, message, deleted, failed
+
+    def __init__(self, db):
+        super().__init__()
+        self.db = db
+        self._stop = False
+
+    def request_stop(self):
+        self._stop = True
+
+    def run(self):
+        def _cb(msg: str, pct: float):
+            self.progress.emit(msg, pct)
+        try:
+            deleted, failed = delete_checked(
+                self.db, progress_cb=_cb, stop_fn=lambda: self._stop,
+            )
+            self.finished.emit(True, f"Deleted: {deleted}\nFailed: {failed}", deleted, failed)
+        except Exception as e:
+            self.finished.emit(False, f"Delete failed:\n{e!r}", 0, 0)
+
+
+class _DeleteHandler(QObject):
+    """Holds strong references to slots for _DeleteWorker signals."""
+
+    def __init__(self, tab, thread: QThread, dlg: QProgressDialog):
+        super().__init__(tab)
+        self._tab = tab
+        self._thread = thread
+        self._dlg = dlg
+
+    def on_progress(self, msg: str, pct: float):
+        if self._dlg.maximum() == 0:
+            self._dlg.setRange(0, 100)
+        self._dlg.setValue(int(pct))
+        self._dlg.setLabelText(msg)
+        if self._tab.on_activity_progress:
+            self._tab.on_activity_progress(msg, pct)
+
+    def on_finished(self, ok: bool, msg: str, deleted: int, failed: int):
+        if self._thread:
+            self._thread.quit()
+            self._thread.wait(5000)
+        self._dlg.close()
+        if self._tab.on_activity_progress:
+            self._tab.on_activity_progress("Idle", -1.0)
+        self._tab._worker_thread = None
+        self._tab._worker = None
+        self._tab._worker_handler = None
+        if ok:
+            QMessageBox.information(self._tab, "Delete", msg)
+        else:
+            QMessageBox.critical(self._tab, "Delete", msg)
+        self._tab.refresh()
+        if self._tab.current_work_key:
+            self._tab.load_work(self._tab.current_work_key)
+
+    def on_canceled(self):
+        w = self._tab._worker
+        if w:
+            w.request_stop()
+
+
+# ---------------------------------------------------------------------------
+# Review tab
+# ---------------------------------------------------------------------------
+
 class ReviewTab(QWidget):
-    def __init__(self, get_db, get_author_db):
+    def __init__(self, get_db, get_author_db, on_activity_progress=None):
         super().__init__()
         self.get_db = get_db
         self.get_author_db = get_author_db
+        self.on_activity_progress = on_activity_progress
         self.current_work_key: str | None = None
+        self._worker_thread: QThread | None = None
+        self._worker = None
+        self._worker_handler = None
 
         lay = QVBoxLayout(self)
 
@@ -68,6 +151,66 @@ class ReviewTab(QWidget):
 
         lay.addLayout(row, 1)
 
+    # ------------------------------------------------------------------
+    # Worker management
+    # ------------------------------------------------------------------
+
+    def _start_delete_worker(self, worker: _DeleteWorker):
+        """Start the delete worker with a modal progress dialog."""
+        if self._worker_thread and self._worker_thread.isRunning():
+            QMessageBox.information(self, "Delete", "A delete operation is already in progress.")
+            return
+
+        thread = QThread()
+        self._worker_thread = thread
+        self._worker = worker
+
+        dlg = QProgressDialog("Sending files to Recycle Bin…", "Cancel", 0, 100, self)
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setRange(0, 0)   # indeterminate until first progress signal
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+
+        handler = _DeleteHandler(self, thread, dlg)
+        self._worker_handler = handler
+
+        worker.progress.connect(handler.on_progress)
+        worker.finished.connect(handler.on_finished)
+        dlg.canceled.connect(handler.on_canceled)
+
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        thread.start()
+        dlg.show()
+
+    # ------------------------------------------------------------------
+    # Data helpers
+    # ------------------------------------------------------------------
+
+    def _save_checks_silent(self) -> bool:
+        """Flush the table checkboxes to the DB without showing a dialog.
+        Returns True on success, False if the transaction failed."""
+        db = self.get_db()
+        if not db:
+            return True
+        db.begin()
+        try:
+            for i in range(self.table.rowCount()):
+                item = self.table.item(i, 0)
+                dqid = int(item.data(256))
+                checked = 1 if item.checkState() == Qt.Checked else 0
+                db.execute("UPDATE deletion_queue SET checked=? WHERE id=?", (checked, dqid))
+            db.commit()
+            return True
+        except Exception as e:
+            db.rollback()
+            QMessageBox.critical(self, "Save", f"Failed:\n{e!r}")
+            return False
+
+    # ------------------------------------------------------------------
+    # Slots
+    # ------------------------------------------------------------------
 
     def refresh(self):
         db = self.get_db()
@@ -76,6 +219,9 @@ class ReviewTab(QWidget):
         if db.get_state("analyze_completed", "0") != "1":
             self.top.setText("Review & Delete: Analyze must complete first.")
             return
+
+        if self.on_activity_progress:
+            self.on_activity_progress("Refreshing review list…", -1.0)
 
         self.work_list.clear()
         rows = db.query_all(
@@ -97,6 +243,9 @@ class ReviewTab(QWidget):
             self.work_list.addItem(item)
 
         self.top.setText(f"Review & Delete: loaded {len(rows)} works (showing up to 5000). Select a work.")
+
+        if self.on_activity_progress:
+            self.on_activity_progress("Idle", -1.0)
 
     def on_work_selected(self, cur: QListWidgetItem, prev: QListWidgetItem):
         if not cur:
@@ -156,6 +305,8 @@ class ReviewTab(QWidget):
         db = self.get_db()
         if not db:
             return
+        if self.on_activity_progress:
+            self.on_activity_progress("Saving checkmarks…", -1.0)
         db.begin()
         try:
             for i in range(self.table.rowCount()):
@@ -166,19 +317,26 @@ class ReviewTab(QWidget):
             db.commit()
         except Exception as e:
             db.rollback()
+            if self.on_activity_progress:
+                self.on_activity_progress("Idle", -1.0)
             QMessageBox.critical(self, "Save", f"Failed:\n{e!r}")
             return
+        if self.on_activity_progress:
+            self.on_activity_progress("Idle", -1.0)
         QMessageBox.information(self, "Save", "Checkmarks saved.")
-
 
     def skip_current_work(self):
         db = self.get_db()
         if not db or not self.current_work_key:
             return
+        if self.on_activity_progress:
+            self.on_activity_progress("Skipping work…", -1.0)
         db.execute(
             "UPDATE deletion_queue SET checked=0, reason='SKIP (manual)' WHERE work_key=?",
             (self.current_work_key,),
         )
+        if self.on_activity_progress:
+            self.on_activity_progress("Idle", -1.0)
         self.load_work(self.current_work_key)
 
     def mark_invalid_author_for_work(self):
@@ -203,6 +361,9 @@ class ReviewTab(QWidget):
         if QMessageBox.question(self, "Invalid Author", "Mark author(s) from this work as invalid and skip deletion for this work?") != QMessageBox.Yes:
             return
 
+        if self.on_activity_progress:
+            self.on_activity_progress("Marking invalid author…", -1.0)
+
         author_db.begin()
         try:
             for r in rows:
@@ -224,6 +385,8 @@ class ReviewTab(QWidget):
             author_db.commit()
         except Exception as e:
             author_db.rollback()
+            if self.on_activity_progress:
+                self.on_activity_progress("Idle", -1.0)
             QMessageBox.critical(self, "Invalid Author", f"Failed:\n{e!r}")
             return
 
@@ -231,6 +394,8 @@ class ReviewTab(QWidget):
             "UPDATE deletion_queue SET checked=0, reason='SKIP (invalid author)' WHERE work_key=?",
             (self.current_work_key,),
         )
+        if self.on_activity_progress:
+            self.on_activity_progress("Idle", -1.0)
         QMessageBox.information(self, "Invalid Author", "Author(s) marked invalid. Run Analyze again to rebuild author DB.")
         self.load_work(self.current_work_key)
 
@@ -264,7 +429,6 @@ class ReviewTab(QWidget):
                 continue
             dst = src.rsplit("/", 1)[0] + "/" + new_name if "/" in src else new_name
             if "\\" in src and "\\" in src:
-                import os
                 dst = os.path.join(os.path.dirname(src), new_name)
             plan.append({"file_id": int(r["id"]), "src": src, "dst": dst, "new_name": new_name})
         return plan
@@ -295,7 +459,9 @@ class ReviewTab(QWidget):
         if dlg.exec() != QDialog.Accepted:
             return
 
-        import os
+        if self.on_activity_progress:
+            self.on_activity_progress(f"Renaming {len(plan)} file(s)…", -1.0)
+
         rollback = []
         db.begin()
         try:
@@ -318,8 +484,13 @@ class ReviewTab(QWidget):
                         os.rename(dst, src)
                 except Exception:
                     pass
+            if self.on_activity_progress:
+                self.on_activity_progress("Idle", -1.0)
             QMessageBox.critical(self, "Canonical Rename", f"Failed:\n{e!r}")
             return
+
+        if self.on_activity_progress:
+            self.on_activity_progress("Idle", -1.0)
         QMessageBox.information(self, "Canonical Rename", f"Applied {len(rollback)} rename(s).")
         self.refresh()
         if self.current_work_key:
@@ -329,18 +500,12 @@ class ReviewTab(QWidget):
         db = self.get_db()
         if not db:
             return
-        self.save_checks()
+        # Silently flush checkboxes to DB first, then confirm before kicking off worker.
+        if not self._save_checks_silent():
+            return
         if self.chk_rename_keep.isChecked():
             self.preview_and_apply_canonical_renames()
         if QMessageBox.question(self, "Delete", "Send all checked files to Recycle Bin?") != QMessageBox.Yes:
             return
-        try:
-            deleted, failed = delete_checked(db)
-        except Exception as e:
-            QMessageBox.critical(self, "Delete", f"Delete failed:\n{e!r}")
-            return
-
-        QMessageBox.information(self, "Delete", f"Deleted: {deleted}\nFailed: {failed}")
-        self.refresh()
-        if self.current_work_key:
-            self.load_work(self.current_work_key)
+        worker = _DeleteWorker(db)
+        self._start_delete_worker(worker)

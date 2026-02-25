@@ -94,7 +94,13 @@ def _start_or_resume_run(db: AuthorDB, dump_date: str, dump_file: str) -> tuple[
     return rid, 0, False
 
 
-def import_latest_redirect_dump(db: AuthorDB, folder: str, checkpoint_every: int = 5000) -> dict:
+def import_latest_redirect_dump(
+    db: AuthorDB,
+    folder: str,
+    checkpoint_every: int = 5000,
+    progress_cb=None,   # callable(msg: str, pct: float) — pct in [0, 100]
+    stop_fn=None,       # callable() -> bool
+) -> dict:
     dump_file, dump_date = discover_latest_redirect_dump_file(folder)
     if not dump_file or not dump_date:
         return {"ok": False, "message": "No redirect dump found."}
@@ -110,6 +116,7 @@ def import_latest_redirect_dump(db: AuthorDB, folder: str, checkpoint_every: int
     if already_done:
         return {"ok": True, "message": f"Redirect dump {dump_date} already completed.", "run_id": run_id}
 
+    file_size = max(1, os.path.getsize(dump_file))
     processed = start_line
     stored = 0
     errors = 0
@@ -117,7 +124,10 @@ def import_latest_redirect_dump(db: AuthorDB, folder: str, checkpoint_every: int
         db.begin()
         line_no = 0
         with open(dump_file, "r", encoding="utf-8", errors="replace") as fh:
-            for line in fh:
+            while True:
+                line = fh.readline()
+                if not line:
+                    break
                 line_no += 1
                 if line_no <= start_line:
                     continue
@@ -139,6 +149,16 @@ def import_latest_redirect_dump(db: AuthorDB, folder: str, checkpoint_every: int
                     )
                     db.commit()
                     db.begin()
+                    if stop_fn and stop_fn():
+                        db.execute(
+                            "UPDATE ol_import_runs SET status='failed',last_error='Cancelled',updated_at=strftime('%s','now') WHERE id=?",
+                            (run_id,),
+                        )
+                        db.commit()
+                        return {"ok": False, "message": f"Cancelled at line {line_no}.", "run_id": run_id}
+                    if progress_cb:
+                        pct = min(58.0, 60.0 * fh.tell() / file_size)
+                        progress_cb(f"Loading: line {line_no}, stored {stored}", pct)
         db.execute(
             "UPDATE ol_import_runs SET progress_line=?,rows_processed=?,redirects_stored=?,errors_count=?,status='completed',completed_at=strftime('%s','now'),updated_at=strftime('%s','now') WHERE id=?",
             (processed, processed, stored, errors, run_id),
@@ -152,65 +172,110 @@ def import_latest_redirect_dump(db: AuthorDB, folder: str, checkpoint_every: int
         )
         return {"ok": False, "message": f"Redirect import failed: {e!r}", "run_id": run_id}
 
-    mig = migrate_redirect_aliases(db, dump_date)
+    if progress_cb:
+        progress_cb("Migrating redirect aliases…", 60.0)
+
+    def _mig_progress(msg: str, pct: float):
+        if progress_cb:
+            progress_cb(msg, 60.0 + pct * 0.40)
+
+    mig = migrate_redirect_aliases(db, dump_date, progress_cb=_mig_progress, stop_fn=stop_fn)
+
+    if mig.get("cancelled"):
+        # Reset status so the next run skips loading (progress_line = EOF) and re-runs migration.
+        db.execute(
+            "UPDATE ol_import_runs SET status='failed',last_error='Migration cancelled',updated_at=strftime('%s','now') WHERE id=?",
+            (run_id,),
+        )
+        db.commit()
+        return {"ok": False, "message": "Migration cancelled.", "run_id": run_id}
+
     db.execute("UPDATE ol_import_runs SET aliases_added=?,updated_at=strftime('%s','now') WHERE id=?", (int(mig.get("aliases_added", 0)), run_id))
     return {"ok": True, "message": f"Redirect import completed for {dump_date}.", "run_id": run_id, **mig}
 
 
-def migrate_redirect_aliases(db: AuthorDB, dump_date: str) -> dict:
+def migrate_redirect_aliases(
+    db: AuthorDB,
+    dump_date: str,
+    progress_cb=None,           # callable(msg: str, pct: float) — pct in [0, 100]
+    stop_fn=None,               # callable() -> bool
+    checkpoint_every: int = 2000,
+) -> dict:
     rows = db.query_all("SELECT from_key,to_key FROM ol_author_redirects WHERE dump_date=?", (dump_date,))
     redirect_map = {str(r["from_key"]): str(r["to_key"]) for r in rows}
+    total = max(1, len(redirect_map))
     aliases_added = 0
     loops = 0
     unresolved = 0
+    processed = 0
 
     db.begin()
     try:
         for from_key, to_key in list(redirect_map.items()):
+            processed += 1
+
             canon_key, loop = resolve_redirect_target(redirect_map, from_key)
             if loop:
                 loops += 1
                 logger.warning("redirect_loop_detected from=%s", from_key)
             if canon_key == from_key:
+                # Self-redirect — nothing to merge, but still counts toward progress.
+                if processed % checkpoint_every == 0:
+                    db.commit()
+                    db.begin()
+                    if stop_fn and stop_fn():
+                        return {"aliases_added": aliases_added, "loops": loops, "unresolved": unresolved, "cancelled": True}
+                    if progress_cb:
+                        progress_cb(f"Migrating {processed}/{total}: {aliases_added} aliases added", min(99.0, 100.0 * processed / total))
                 continue
 
             from_rec = db.query_one("SELECT author_norm, canonical_name FROM author_dump_records WHERE ol_key=?", (from_key,))
             canon_rec = db.query_one("SELECT author_norm FROM author_dump_records WHERE ol_key=?", (canon_key,))
             if not canon_rec:
                 unresolved += 1
-                continue
+            else:
+                canon_norm = str(canon_rec["author_norm"])
+                alias_norms = set()
+                if from_rec:
+                    if str(from_rec["author_norm"] or ""):
+                        alias_norms.add(str(from_rec["author_norm"]))
+                    for ar in db.query_all("SELECT alias_norm FROM author_aliases WHERE author_norm=?", (str(from_rec["author_norm"] or ""),)):
+                        alias_norms.add(str(ar["alias_norm"] or ""))
 
-            canon_norm = str(canon_rec["author_norm"])
-            alias_norms = set()
-            if from_rec:
-                if str(from_rec["author_norm"] or ""):
-                    alias_norms.add(str(from_rec["author_norm"]))
-                for ar in db.query_all("SELECT alias_norm FROM author_aliases WHERE author_norm=?", (str(from_rec["author_norm"] or ""),)):
-                    alias_norms.add(str(ar["alias_norm"] or ""))
+                if not alias_norms:
+                    unresolved += 1
 
-            if not alias_norms:
-                unresolved += 1
+                for alias_norm in [a for a in alias_norms if a]:
+                    db.execute(
+                        "INSERT INTO author_aliases(alias_norm,author_norm,author_display,confidence,source,source_key,updated_at) VALUES(?,?,?,?,?,?,strftime('%s','now')) ON CONFLICT(alias_norm) DO UPDATE SET author_norm=excluded.author_norm,author_display=excluded.author_display,confidence=excluded.confidence,source='openlibrary_redirect',source_key=excluded.source_key,updated_at=excluded.updated_at",
+                        (alias_norm, canon_norm, alias_norm, 1.0, "openlibrary_redirect", from_key),
+                    )
+                    aliases_added += 1
 
-            for alias_norm in [a for a in alias_norms if a]:
+                # Remove the superseded author from known_authors; the canonical record remains.
+                if from_rec and str(from_rec["author_norm"] or "") != canon_norm:
+                    db.execute("DELETE FROM known_authors WHERE normalized_name=?", (str(from_rec["author_norm"]),))
+
                 db.execute(
-                    "INSERT INTO author_aliases(alias_norm,author_norm,author_display,confidence,source,source_key,updated_at) VALUES(?,?,?,?,?,?,strftime('%s','now')) ON CONFLICT(alias_norm) DO UPDATE SET author_norm=excluded.author_norm,author_display=excluded.author_display,confidence=excluded.confidence,source='openlibrary_redirect',source_key=excluded.source_key,updated_at=excluded.updated_at",
-                    (alias_norm, canon_norm, alias_norm, 1.0, "openlibrary_redirect", from_key),
+                    "UPDATE ol_author_redirects SET to_key_resolved=?,updated_at=strftime('%s','now') WHERE from_key=?",
+                    (canon_key, from_key),
                 )
-                aliases_added += 1
 
-            # Remove the superseded author from known_authors; the canonical record remains.
-            if from_rec and str(from_rec["author_norm"] or "") != canon_norm:
-                db.execute("DELETE FROM known_authors WHERE normalized_name=?", (str(from_rec["author_norm"]),))
+            if processed % checkpoint_every == 0:
+                db.commit()
+                db.begin()
+                if stop_fn and stop_fn():
+                    return {"aliases_added": aliases_added, "loops": loops, "unresolved": unresolved, "cancelled": True}
+                if progress_cb:
+                    progress_cb(f"Migrating {processed}/{total}: {aliases_added} aliases added", min(99.0, 100.0 * processed / total))
 
-            db.execute(
-                "UPDATE ol_author_redirects SET to_key_resolved=?,updated_at=strftime('%s','now') WHERE from_key=?",
-                (canon_key, from_key),
-            )
         db.commit()
     except Exception:
         db.rollback()
         raise
 
+    if progress_cb:
+        progress_cb(f"Migration done: {total} redirects, {aliases_added} aliases", 100.0)
     return {"aliases_added": aliases_added, "loops": loops, "unresolved": unresolved}
 
 
