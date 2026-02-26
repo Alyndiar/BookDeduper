@@ -1,7 +1,7 @@
 from __future__ import annotations
 from PySide6.QtCore import QThread
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QTextEdit, QMessageBox
-from .scanner import ScanWorker, ScanConfig
+from .scanner import ScanWorker, ScanConfig, ReparseWorker
 from .sevenzip import detect_7z
 
 class ScanTab(QWidget):
@@ -51,11 +51,23 @@ class ScanTab(QWidget):
         self.btn_stop.setEnabled(False)
         row.addWidget(self.btn_stop)
 
+        row.addSpacing(20)
+
+        self.btn_reparse = QPushButton("Reparse Filenames")
+        self.btn_reparse.setToolTip(
+            "Re-derive author/series/title/work_key from stored filenames "
+            "using current parser logic and author database. No filesystem I/O."
+        )
+        self.btn_reparse.clicked.connect(self.start_reparse)
+        row.addWidget(self.btn_reparse)
+
         lay.addLayout(row)
 
 
         self.thread: QThread | None = None
         self.worker: ScanWorker | None = None
+        self._reparse_thread: QThread | None = None
+        self._reparse_worker: ReparseWorker | None = None
 
 
     def refresh(self):
@@ -157,6 +169,85 @@ class ScanTab(QWidget):
         self.worker = None
 
         self.btn_start.setEnabled(True)
+        self.btn_pause.setEnabled(False)
+        self.btn_resume.setEnabled(False)
+        self.btn_stop.setEnabled(False)
+
+        if self.on_activity_progress:
+            self.on_activity_progress("Idle", -1.0)
+        self.on_scan_completed(ok)
+
+    # ------------------------------------------------------------------
+    #  Reparse Filenames
+    # ------------------------------------------------------------------
+
+    def start_reparse(self):
+        db = self.get_db()
+        if not db:
+            QMessageBox.information(self, "Reparse", "Open a project first.")
+            return
+
+        if self.thread or self._reparse_thread:
+            QMessageBox.information(self, "Reparse", "A scan or reparse is already running.")
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Reparse Filenames",
+            "This will re-derive author, series, title, and work_key for every file "
+            "using the current parser logic and author database.\n\n"
+            "Existing analysis results (duplicates, deletion queue) will be cleared "
+            "so you can re-analyse with the updated data.\n\n"
+            "Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self._reparse_thread = QThread()
+        self._reparse_worker = ReparseWorker(db, author_db=self.get_author_db())
+        self._reparse_worker.moveToThread(self._reparse_thread)
+
+        self._reparse_thread.started.connect(self._reparse_worker.run)
+        self._reparse_worker.progress.connect(self.on_progress)
+        self._reparse_worker.stats.connect(self.on_stats)
+        self._reparse_worker.finished.connect(self._on_reparse_finished)
+
+        self.btn_start.setEnabled(False)
+        self.btn_reparse.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+
+        # Allow the Stop button to abort the reparse too
+        self.btn_stop.clicked.disconnect()
+        self.btn_stop.clicked.connect(self._stop_reparse)
+
+        self.append("=== Reparse started ===")
+        if self.on_activity_progress:
+            self.on_activity_progress("Reparsing", 0.0)
+        self._reparse_thread.start()
+
+    def _stop_reparse(self):
+        if self._reparse_worker:
+            self._reparse_worker.request_stop()
+            self.append("=== Reparse stop requested ===")
+
+    def _on_reparse_finished(self, ok: bool, msg: str):
+        self.append(msg)
+        self.status.setText(f"Reparse: {msg}")
+
+        if self._reparse_thread:
+            self._reparse_thread.quit()
+            self._reparse_thread.wait(2000)
+        self._reparse_thread = None
+        self._reparse_worker = None
+
+        # Restore Stop button to its normal scan handler
+        self.btn_stop.clicked.disconnect()
+        self.btn_stop.clicked.connect(self.stop)
+
+        self.btn_start.setEnabled(True)
+        self.btn_reparse.setEnabled(True)
         self.btn_pause.setEnabled(False)
         self.btn_resume.setEnabled(False)
         self.btn_stop.setEnabled(False)
