@@ -1,2 +1,3 @@
 PySide6>=6.6
 send2trash>=1.8
+duckdb>=1.0

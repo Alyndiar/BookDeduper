@@ -7,6 +7,7 @@ from PySide6.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QTabWidget, QLa
 from .db import DB
 from .author_db import AuthorDB
 from .ui_project import ProjectTab
+from .ui_parquet import ParquetTab
 from .ui_roots import RootsTab
 from .ui_scan import ScanTab
 from .ui_analyze import AnalyzeTab
@@ -35,6 +36,7 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.setTabsClosable(False)
         self.project_tab = ProjectTab(on_project_opened=self.on_project_opened, on_activity_progress=self.on_activity_progress, on_author_db_opened=self.on_author_db_opened_standalone)
+        self.parquet_tab = ParquetTab(get_author_db=lambda: self.author_db, on_activity_progress=self.on_activity_progress)
         self.roots_tab = RootsTab(get_db=lambda: self.db)
         self.scan_tab = ScanTab(get_db=lambda: self.db, get_author_db=lambda: self.author_db, on_scan_completed=self.on_scan_completed, on_activity_progress=self.on_activity_progress)
         self.analyze_tab = AnalyzeTab(get_db=lambda: self.db, get_author_db=lambda: self.author_db, on_analyze_completed=self.on_analyze_completed, on_activity_progress=self.on_activity_progress)
@@ -42,13 +44,15 @@ class MainWindow(QMainWindow):
         self.authors_tab = AuthorsTab(get_db=lambda: self.db, get_author_db=lambda: self.author_db, on_activity_progress=self.on_activity_progress)
 
         self.tabs.addTab(self.project_tab, "1) Project")
-        self.tabs.addTab(self.roots_tab, "2) Roots")
-        self.tabs.addTab(self.scan_tab, "3) Scan")
-        self.tabs.addTab(self.analyze_tab, "4) Analyze")
-        self.tabs.addTab(self.review_tab, "5) Review/Delete")
-        self.tabs.addTab(self.authors_tab, "6) Authors DB")
+        self.tabs.addTab(self.parquet_tab, "2) Parquet")
+        self.tabs.addTab(self.roots_tab, "3) Roots")
+        self.tabs.addTab(self.scan_tab, "4) Scan")
+        self.tabs.addTab(self.analyze_tab, "5) Analyze")
+        self.tabs.addTab(self.review_tab, "6) Review/Delete")
+        self.tabs.addTab(self.authors_tab, "7) Authors DB")
 
-        for i in range(1, 6):
+        # Parquet tab (index 1) is always enabled; project-dependent tabs start disabled
+        for i in range(2, 7):
             self.tabs.setTabEnabled(i, False)
 
         w = QWidget()
@@ -144,7 +148,7 @@ class MainWindow(QMainWindow):
                 return "Pre-seed Authors"
             return "Analyze Duplicates"
         idx = self.tabs.currentIndex()
-        if idx == 4:
+        if idx == 5:
             return "Review"
         return "Idle"
 
@@ -285,26 +289,27 @@ class MainWindow(QMainWindow):
         if self.author_db:
             self.author_db.add_io_callback(self._io_callback)
 
-        self.tabs.setTabEnabled(1, True)
+        self.tabs.setTabEnabled(2, True)
         self.roots_tab.refresh()
 
         scan_done = (self.db.get_state("scan_completed", "0") == "1")
         analyze_done = (self.db.get_state("analyze_duplicates_completed", self.db.get_state("analyze_completed", "0")) == "1")
         authors_done = (self.db.get_state("analyze_authors_completed", "0") == "1")
 
-        self.tabs.setTabEnabled(2, True)
-        self.tabs.setTabEnabled(3, scan_done)
-        self.tabs.setTabEnabled(4, analyze_done)
+        self.tabs.setTabEnabled(3, True)
+        self.tabs.setTabEnabled(4, scan_done)
+        self.tabs.setTabEnabled(5, analyze_done)
         has_author_db = self.author_db is not None
-        self.tabs.setTabEnabled(5, has_author_db or authors_done or analyze_done)
+        self.tabs.setTabEnabled(6, has_author_db or authors_done or analyze_done)
 
+        self.parquet_tab.refresh()
         self.scan_tab.refresh()
         self.analyze_tab.refresh()
         self.review_tab.refresh()
         self.authors_tab.refresh()
         self.refresh_all_statuses()
 
-        self.tabs.setCurrentIndex(1)
+        self.tabs.setCurrentIndex(2)
 
     def on_author_db_opened_standalone(self, author_db: AuthorDB):
         """Called when the user opens just an author DB without a project DB."""
@@ -316,33 +321,34 @@ class MainWindow(QMainWindow):
                 pass
         self.author_db = author_db
         self.author_db.add_io_callback(self._io_callback)
-        self.tabs.setTabEnabled(5, True)
+        self.tabs.setTabEnabled(6, True)
+        self.parquet_tab.refresh()
         self.authors_tab.refresh()
-        self.tabs.setCurrentIndex(5)
+        self.tabs.setCurrentIndex(6)
         self.refresh_all_statuses()
 
     def on_scan_completed(self, ok: bool):
         if not self.db:
             return
         if ok:
-            self.tabs.setTabEnabled(3, True)
+            self.tabs.setTabEnabled(4, True)
             self.analyze_tab.refresh()
-            self.tabs.setCurrentIndex(3)
+            self.tabs.setCurrentIndex(4)
         else:
-            self.tabs.setTabEnabled(3, False)
+            self.tabs.setTabEnabled(4, False)
         self.refresh_all_statuses()
 
     def on_analyze_completed(self, ok: bool):
         if not self.db:
             return
         if ok:
-            self.tabs.setTabEnabled(4, True)
+            self.tabs.setTabEnabled(5, True)
             self.review_tab.refresh()
             self.authors_tab.refresh()
-            self.tabs.setTabEnabled(5, True)
-            self.tabs.setCurrentIndex(4)
+            self.tabs.setTabEnabled(6, True)
+            self.tabs.setCurrentIndex(5)
         else:
-            self.tabs.setTabEnabled(4, False)
+            self.tabs.setTabEnabled(5, False)
         self.refresh_all_statuses()
 
     def closeEvent(self, event: QCloseEvent):
