@@ -1,10 +1,11 @@
 from __future__ import annotations
 import os
 import json
-from PySide6.QtCore import QObject, QThread, Signal
+from PySide6.QtCore import QObject, QThread, Signal, QSettings
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
-    QFileDialog, QLineEdit, QMessageBox, QCheckBox, QComboBox
+    QFileDialog, QLineEdit, QMessageBox, QCheckBox, QComboBox,
+    QListWidget, QListWidgetItem,
 )
 from .db import DB, MEMORY_PROFILES
 from .author_db import AuthorDB
@@ -102,6 +103,24 @@ class ProjectTab(QWidget):
         arow.addWidget(self.btn_author_standalone)
         lay.addLayout(arow)
 
+        # Recent projects
+        lay.addWidget(QLabel("Recent projects:"))
+        rrow = QHBoxLayout()
+        self.recent_list = QListWidget()
+        self.recent_list.setMaximumHeight(120)
+        self.recent_list.itemDoubleClicked.connect(self._open_recent)
+        rrow.addWidget(self.recent_list)
+        rbtn_col = QVBoxLayout()
+        self.btn_open_recent = QPushButton("Open")
+        self.btn_open_recent.clicked.connect(self._open_recent_selected)
+        rbtn_col.addWidget(self.btn_open_recent)
+        self.btn_remove_recent = QPushButton("Remove")
+        self.btn_remove_recent.clicked.connect(self._remove_recent_selected)
+        rbtn_col.addWidget(self.btn_remove_recent)
+        rbtn_col.addStretch()
+        rrow.addLayout(rbtn_col)
+        lay.addLayout(rrow)
+
         lay.addWidget(QLabel("Settings stored in project DB state:"))
 
         self.chk_folder_skip = QCheckBox("Enable optional folder skipping (heuristic)")
@@ -175,6 +194,73 @@ class ProjectTab(QWidget):
         self._db: DB | None = None
         self._open_thread: QThread | None = None
         self._open_worker: _OpenProjectWorker | None = None
+        self._settings = QSettings("BookDeduper", "BookDeduper")
+        self._refresh_recent_list()
+
+    # ------------------------------------------------------------------
+    #  Recent projects
+    # ------------------------------------------------------------------
+
+    MAX_RECENT = 10
+
+    def _load_recent(self) -> list[dict]:
+        """Return list of dicts: [{project, author_db}, …] most-recent first."""
+        raw = self._settings.value("recent_projects", [])
+        if not isinstance(raw, list):
+            return []
+        out: list[dict] = []
+        for entry in raw:
+            if isinstance(entry, dict) and "project" in entry:
+                out.append(entry)
+        return out[:self.MAX_RECENT]
+
+    def _save_recent(self, entries: list[dict]):
+        self._settings.setValue("recent_projects", entries[:self.MAX_RECENT])
+
+    def _add_recent(self, project_path: str, author_db_path: str = ""):
+        entries = self._load_recent()
+        # Remove existing entry for this project (to move it to top)
+        entries = [e for e in entries if e.get("project") != project_path]
+        entries.insert(0, {"project": project_path, "author_db": author_db_path})
+        self._save_recent(entries)
+        self._refresh_recent_list()
+
+    def _refresh_recent_list(self):
+        self.recent_list.clear()
+        for entry in self._load_recent():
+            proj = entry.get("project", "")
+            adb = entry.get("author_db", "")
+            label = proj
+            if adb:
+                label += f"   (authors: {os.path.basename(adb)})"
+            item = QListWidgetItem(label)
+            item.setData(256, entry)  # Qt.UserRole = 256
+            self.recent_list.addItem(item)
+
+    def _open_recent(self, item: QListWidgetItem):
+        entry = item.data(256)
+        if not entry:
+            return
+        self.path_edit.setText(entry.get("project", ""))
+        self.author_path_edit.setText(entry.get("author_db", ""))
+        self.open_project()
+
+    def _open_recent_selected(self):
+        item = self.recent_list.currentItem()
+        if item:
+            self._open_recent(item)
+
+    def _remove_recent_selected(self):
+        item = self.recent_list.currentItem()
+        if not item:
+            return
+        entry = item.data(256)
+        if not entry:
+            return
+        entries = self._load_recent()
+        entries = [e for e in entries if e.get("project") != entry.get("project")]
+        self._save_recent(entries)
+        self._refresh_recent_list()
 
     def _emit_activity(self, text: str, pct: float = -1.0):
         if self.on_activity_progress:
@@ -338,6 +424,10 @@ class ProjectTab(QWidget):
             self.zlabel.setText("7z.exe: NOT FOUND (install 7-Zip or put 7z.exe in PATH)")
 
         self._refresh_custom_controls_enabled()
+        self._add_recent(
+            self.path_edit.text().strip(),
+            self.author_path_edit.text().strip(),
+        )
         self.on_project_opened(db, author_db_obj)
         status = "Project opened."
         if author_db_obj is None and self.author_path_edit.text().strip():

@@ -1,6 +1,7 @@
 from __future__ import annotations
+import os
 from PySide6.QtCore import QThread
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QTextEdit, QMessageBox
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QTextEdit, QMessageBox, QFileDialog
 from .scanner import ScanWorker, ScanConfig, ReparseWorker
 from .sevenzip import detect_7z
 
@@ -60,6 +61,13 @@ class ScanTab(QWidget):
         )
         self.btn_reparse.clicked.connect(self.start_reparse)
         row.addWidget(self.btn_reparse)
+
+        self.btn_export_unknown = QPushButton("Export Unknown Authors")
+        self.btn_export_unknown.setToolTip(
+            "Export a list of all file paths whose author could not be determined."
+        )
+        self.btn_export_unknown.clicked.connect(self.export_unknown_authors)
+        row.addWidget(self.btn_export_unknown)
 
         lay.addLayout(row)
 
@@ -255,3 +263,42 @@ class ScanTab(QWidget):
         if self.on_activity_progress:
             self.on_activity_progress("Idle", -1.0)
         self.on_scan_completed(ok)
+
+    # ------------------------------------------------------------------
+    #  Export Unknown Authors
+    # ------------------------------------------------------------------
+
+    def export_unknown_authors(self):
+        db = self.get_db()
+        if not db:
+            QMessageBox.information(self, "Export", "Open a project first.")
+            return
+
+        rows = db.query_all(
+            "SELECT path FROM files WHERE author_norm = 'unknown' ORDER BY path"
+        )
+
+        if not rows:
+            QMessageBox.information(self, "Export", "No files with unknown author found.")
+            return
+
+        default_name = os.path.join(
+            os.path.dirname(db.db_path),
+            "unknown_authors.txt",
+        )
+        dest, _ = QFileDialog.getSaveFileName(
+            self, "Save Unknown Authors Report", default_name,
+            "Text files (*.txt);;All files (*)",
+        )
+        if not dest:
+            return
+
+        with open(dest, "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(str(r["path"] or "") + "\n")
+
+        self.append(f"Exported {len(rows)} unknown-author files to {dest}")
+        QMessageBox.information(
+            self, "Export",
+            f"Exported {len(rows)} files with unknown author to:\n{dest}",
+        )

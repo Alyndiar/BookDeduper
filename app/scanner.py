@@ -2,6 +2,7 @@ from __future__ import annotations
 import os
 import time
 import logging
+import traceback
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Tuple
 from PySide6.QtCore import QObject, Signal
@@ -634,7 +635,9 @@ class ReparseWorker(QObject):
             ok, msg = self._run_reparse()
             self.finished.emit(ok, msg)
         except Exception as e:
-            self.finished.emit(False, f"Reparse error: {e!r}")
+            tb = traceback.format_exc()
+            logger.error("Reparse failed:\n%s", tb)
+            self.finished.emit(False, f"Reparse error: {e!r}\n{tb}")
 
     def _run_reparse(self) -> tuple[bool, str]:
         # Borrow helper methods from ScanWorker without starting a real scan
@@ -668,7 +671,7 @@ class ReparseWorker(QObject):
 
         while not self._stop:
             rows = self.db.query_all(
-                "SELECT id, name, ext FROM files WHERE id > ? ORDER BY id LIMIT ?",
+                "SELECT id, path, name, ext FROM files WHERE id > ? ORDER BY id LIMIT ?",
                 (last_id, self.BATCH),
             )
             if not rows:
@@ -683,47 +686,55 @@ class ReparseWorker(QObject):
 
                     fid = int(r["id"])
                     last_id = fid
+                    path = str(r["path"] or "")
                     name = str(r["name"] or "")
 
-                    parsed = parse_filename(name, known_authors=known_authors)
+                    try:
+                        parsed = parse_filename(name, known_authors=known_authors)
 
-                    # Alias correction (both unknown and variant)
-                    _helper._try_correct_author(parsed, name, alias_map)
+                        # Alias correction (both unknown and variant)
+                        _helper._try_correct_author(parsed, name, alias_map)
 
-                    series_index_norm = _helper._series_index_norm(parsed.series_index)
+                        series_index_norm = _helper._series_index_norm(parsed.series_index)
 
-                    # Update files row
-                    self.db.execute(
-                        """UPDATE files SET
-                             author=?, series=?, series_index=?, title=?, tags=?,
-                             author_norm=?, series_norm=?, title_norm=?, work_key=?
-                           WHERE id=?""",
-                        (
-                            parsed.author, parsed.series, parsed.series_index,
-                            parsed.title, " | ".join(parsed.tags),
-                            parsed.author_norm, parsed.series_norm, parsed.title_norm,
-                            parsed.work_key, fid,
-                        ),
-                    )
+                        # Update files row
+                        self.db.execute(
+                            """UPDATE files SET
+                                 author=?, series=?, series_index=?, title=?, tags=?,
+                                 author_norm=?, series_norm=?, title_norm=?, work_key=?
+                               WHERE id=?""",
+                            (
+                                parsed.author, parsed.series, parsed.series_index,
+                                parsed.title, " | ".join(parsed.tags),
+                                parsed.author_norm, parsed.series_norm, parsed.title_norm,
+                                parsed.work_key, fid,
+                            ),
+                        )
 
-                    # Upsert works
-                    self.db.execute(
-                        """INSERT INTO works(
-                             work_key, author_norm, series_norm, series_index_norm, title_norm,
-                             display_author, display_series, display_series_index, display_title
-                           ) VALUES(?,?,?,?,?,?,?,?,?)
-                           ON CONFLICT(work_key) DO UPDATE SET
-                             author_norm=excluded.author_norm,
-                             series_norm=excluded.series_norm,
-                             series_index_norm=excluded.series_index_norm,
-                             title_norm=excluded.title_norm""",
-                        (
-                            parsed.work_key, parsed.author_norm, parsed.series_norm,
-                            series_index_norm, parsed.title_norm,
-                            parsed.author, parsed.series or "",
-                            str(parsed.series_index or ""), parsed.title,
-                        ),
-                    )
+                        # Upsert works
+                        self.db.execute(
+                            """INSERT INTO works(
+                                 work_key, author_norm, series_norm, series_index_norm, title_norm,
+                                 display_author, display_series, display_series_index, display_title
+                               ) VALUES(?,?,?,?,?,?,?,?,?)
+                               ON CONFLICT(work_key) DO UPDATE SET
+                                 author_norm=excluded.author_norm,
+                                 series_norm=excluded.series_norm,
+                                 series_index_norm=excluded.series_index_norm,
+                                 title_norm=excluded.title_norm""",
+                            (
+                                parsed.work_key, parsed.author_norm, parsed.series_norm,
+                                series_index_norm, parsed.title_norm,
+                                parsed.author, parsed.series or "",
+                                str(parsed.series_index or ""), parsed.title,
+                            ),
+                        )
+                    except Exception:
+                        st["errors"] = st.get("errors", 0) + 1
+                        logger.error("Reparse failed for file id=%s path=%r:\n%s",
+                                     fid, path, traceback.format_exc())
+                        self.progress.emit(f"Reparse: error on file id={fid} path={path!r} (skipped)")
+                        continue
 
                     st["processed"] += 1
 
@@ -755,5 +766,7 @@ class ReparseWorker(QObject):
             self.db.rollback()
             raise
 
-        self.progress.emit(f"Reparse complete: {processed} files re-parsed.")
-        return True, f"Reparse complete: {processed} files re-parsed."
+        errors = st.get("errors", 0)
+        suffix = f" ({errors} errors skipped)" if errors else ""
+        self.progress.emit(f"Reparse complete: {processed} files re-parsed.{suffix}")
+        return True, f"Reparse complete: {processed} files re-parsed.{suffix}"

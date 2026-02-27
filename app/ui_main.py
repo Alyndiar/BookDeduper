@@ -13,6 +13,7 @@ from .ui_scan import ScanTab
 from .ui_analyze import AnalyzeTab
 from .ui_review import ReviewTab
 from .ui_authors import AuthorsTab
+from .ui_fix_authors import FixAuthorsTab
 
 
 class MainWindow(QMainWindow):
@@ -42,6 +43,7 @@ class MainWindow(QMainWindow):
         self.analyze_tab = AnalyzeTab(get_db=lambda: self.db, get_author_db=lambda: self.author_db, on_analyze_completed=self.on_analyze_completed, on_activity_progress=self.on_activity_progress)
         self.review_tab = ReviewTab(get_db=lambda: self.db, get_author_db=lambda: self.author_db, on_activity_progress=self.on_activity_progress)
         self.authors_tab = AuthorsTab(get_db=lambda: self.db, get_author_db=lambda: self.author_db, on_activity_progress=self.on_activity_progress)
+        self.fix_authors_tab = FixAuthorsTab(get_db=lambda: self.db, get_author_db=lambda: self.author_db, on_activity_progress=self.on_activity_progress)
 
         self.tabs.addTab(self.project_tab, "1) Project")
         self.tabs.addTab(self.parquet_tab, "2) Parquet")
@@ -50,9 +52,10 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.analyze_tab, "5) Analyze")
         self.tabs.addTab(self.review_tab, "6) Review/Delete")
         self.tabs.addTab(self.authors_tab, "7) Authors DB")
+        self.tabs.addTab(self.fix_authors_tab, "8) Fix Authors")
 
         # Parquet tab (index 1) is always enabled; project-dependent tabs start disabled
-        for i in range(2, 7):
+        for i in range(2, 8):
             self.tabs.setTabEnabled(i, False)
 
         w = QWidget()
@@ -150,6 +153,8 @@ class MainWindow(QMainWindow):
         idx = self.tabs.currentIndex()
         if idx == 5:
             return "Review"
+        if idx == 7:
+            return "Fix Authors"
         return "Idle"
 
     def _on_tab_changed(self, _idx: int):
@@ -301,12 +306,14 @@ class MainWindow(QMainWindow):
         self.tabs.setTabEnabled(5, analyze_done)
         has_author_db = self.author_db is not None
         self.tabs.setTabEnabled(6, has_author_db or authors_done or analyze_done)
+        self.tabs.setTabEnabled(7, scan_done)
 
         self.parquet_tab.refresh()
         self.scan_tab.refresh()
         self.analyze_tab.refresh()
         self.review_tab.refresh()
         self.authors_tab.refresh()
+        self.fix_authors_tab.refresh()
         self.refresh_all_statuses()
 
         self.tabs.setCurrentIndex(2)
@@ -332,7 +339,9 @@ class MainWindow(QMainWindow):
             return
         if ok:
             self.tabs.setTabEnabled(4, True)
+            self.tabs.setTabEnabled(7, True)
             self.analyze_tab.refresh()
+            self.fix_authors_tab.refresh()
             self.tabs.setCurrentIndex(4)
         else:
             self.tabs.setTabEnabled(4, False)
