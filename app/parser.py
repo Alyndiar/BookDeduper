@@ -146,6 +146,7 @@ def normalize_author_display(author: str) -> str:
         return "Unknown"
     normalized = [_normalize_author_part(p) for p in parts]
     normalized = [n for n in normalized if n]
+    normalized.sort()
     return " & ".join(normalized) if normalized else "Unknown"
 
 

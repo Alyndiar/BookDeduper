@@ -2,6 +2,7 @@ from __future__ import annotations
 import os
 import time
 import logging
+import traceback
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Tuple
 from PySide6.QtCore import QObject, Signal
@@ -190,6 +191,25 @@ class ScanWorker(QObject):
             pass
         return out
 
+    def _load_known_authors(self) -> Dict[str, Dict]:
+        """Load known_authors from authors.db for parse_filename() scoring boosts."""
+        out: Dict[str, Dict] = {}
+        if self.author_db:
+            try:
+                rows = self.author_db.query_all(
+                    "SELECT normalized_name, canonical_name, frequency FROM known_authors"
+                )
+                for r in rows:
+                    norm = str(r["normalized_name"] or "").strip()
+                    if norm:
+                        out[norm] = {
+                            "canonical_name": str(r["canonical_name"] or ""),
+                            "frequency": int(r["frequency"] or 0),
+                        }
+            except Exception:
+                pass
+        return out
+
     def _candidate_author_aliases(self, filename: str) -> List[str]:
         stem = os.path.basename(filename)
         if "." in stem:
@@ -210,15 +230,24 @@ class ScanWorker(QObject):
         return out
 
     def _try_correct_author(self, parsed, filename: str, alias_map: Dict[str, Tuple[str, str]]) -> bool:
-        if parsed.author_norm and parsed.author_norm != "unknown":
+        # Case 1: unknown author — try candidate aliases from filename segments
+        if not parsed.author_norm or parsed.author_norm == "unknown":
+            for alias_norm in self._candidate_author_aliases(filename):
+                hit = alias_map.get(alias_norm)
+                if not hit:
+                    continue
+                corrected_norm, corrected_display = hit
+                parsed.author = corrected_display
+                parsed.author_norm = corrected_norm
+                parsed.work_key = make_work_key(parsed.author_norm, parsed.series_norm, parsed.title_norm, self._series_index_norm(parsed.series_index))
+                return True
             return False
-        for alias_norm in self._candidate_author_aliases(filename):
-            hit = alias_map.get(alias_norm)
-            if not hit:
-                continue
-            corrected_norm, corrected_display = hit
-            parsed.author = corrected_display
-            parsed.author_norm = corrected_norm
+
+        # Case 2: author was found but may be a variant — canonicalize via alias map
+        hit = alias_map.get(parsed.author_norm)
+        if hit and hit[0] != parsed.author_norm:
+            parsed.author = hit[1]
+            parsed.author_norm = hit[0]
             parsed.work_key = make_work_key(parsed.author_norm, parsed.series_norm, parsed.title_norm, self._series_index_norm(parsed.series_index))
             return True
         return False
@@ -293,6 +322,7 @@ class ScanWorker(QObject):
         scan_id = self._start_scan_run()
         self._ensure_7z()
         author_aliases = self._load_author_aliases()
+        known_authors = self._load_known_authors()
 
         stack = self._load_stack(roots)
         stats = {
@@ -386,7 +416,7 @@ class ScanWorker(QObject):
                             stats["files_changed"] += 1
 
                             # Tier 1: Filename parsing (always primary — trusted over metadata)
-                            parsed = parse_filename(name)
+                            parsed = parse_filename(name, known_authors=known_authors)
 
                             # Tier 2: EPUB in-file metadata — only when filename parse was low-confidence
                             if parsed.needs_llm and ext.lower() == "epub":
@@ -569,3 +599,174 @@ class ScanWorker(QObject):
             self._save_checkpoint(scan_id, [], "", "", stats)
             self.db.set_state("scan_completed", "1")
             return True, "Scan completed."
+
+
+class ReparseWorker(QObject):
+    """Re-derive author/series/title/work_key for every file already in the DB.
+
+    No filesystem I/O — only re-runs parse_filename() on the ``name`` column
+    stored in the ``files`` table, applies alias correction, rebuilds ``works``,
+    and clears downstream analysis state so the next Analyze run starts fresh.
+    """
+
+    progress = Signal(str)
+    stats = Signal(dict)
+    finished = Signal(bool, str)
+
+    BATCH = 5000
+
+    def __init__(self, db: DB, author_db: AuthorDB | None = None):
+        super().__init__()
+        self.db = db
+        self.author_db = author_db
+        self._stop = False
+
+    def request_stop(self):
+        self._stop = True
+
+    # ------------------------------------------------------------------
+    # Reuse the same helpers that ScanWorker uses.  We instantiate a
+    # lightweight ScanWorker solely to borrow its methods (no scan run
+    # is created).
+    # ------------------------------------------------------------------
+
+    def run(self):
+        try:
+            ok, msg = self._run_reparse()
+            self.finished.emit(ok, msg)
+        except Exception as e:
+            tb = traceback.format_exc()
+            logger.error("Reparse failed:\n%s", tb)
+            self.finished.emit(False, f"Reparse error: {e!r}\n{tb}")
+
+    def _run_reparse(self) -> tuple[bool, str]:
+        # Borrow helper methods from ScanWorker without starting a real scan
+        _helper = ScanWorker.__new__(ScanWorker)
+        _helper.db = self.db
+        _helper.author_db = self.author_db
+
+        known_authors = _helper._load_known_authors()
+        alias_map = _helper._load_author_aliases()
+
+        self.progress.emit("Reparse: counting files…")
+        row = self.db.query_one("SELECT COUNT(*) AS cnt FROM files")
+        total = int(row["cnt"]) if row else 0
+        if total == 0:
+            return True, "Reparse: no files to process."
+
+        self.progress.emit(f"Reparse: {total} files to process…")
+
+        # Phase 1 — clear works table (will be rebuilt)
+        self.db.begin()
+        try:
+            self.db.execute("DELETE FROM works")
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
+
+        processed = 0
+        last_id = 0
+        st = {"processed": 0, "changed": 0}
+
+        while not self._stop:
+            rows = self.db.query_all(
+                "SELECT id, path, name, ext FROM files WHERE id > ? ORDER BY id LIMIT ?",
+                (last_id, self.BATCH),
+            )
+            if not rows:
+                break
+
+            self.db.begin()
+            try:
+                for r in rows:
+                    if self._stop:
+                        self.db.commit()
+                        return False, "Reparse aborted by user."
+
+                    fid = int(r["id"])
+                    last_id = fid
+                    path = str(r["path"] or "")
+                    name = str(r["name"] or "")
+
+                    try:
+                        parsed = parse_filename(name, known_authors=known_authors)
+
+                        # Alias correction (both unknown and variant)
+                        _helper._try_correct_author(parsed, name, alias_map)
+
+                        series_index_norm = _helper._series_index_norm(parsed.series_index)
+
+                        # Update files row
+                        self.db.execute(
+                            """UPDATE files SET
+                                 author=?, series=?, series_index=?, title=?, tags=?,
+                                 author_norm=?, series_norm=?, title_norm=?, work_key=?
+                               WHERE id=?""",
+                            (
+                                parsed.author, parsed.series, parsed.series_index,
+                                parsed.title, " | ".join(parsed.tags),
+                                parsed.author_norm, parsed.series_norm, parsed.title_norm,
+                                parsed.work_key, fid,
+                            ),
+                        )
+
+                        # Upsert works
+                        self.db.execute(
+                            """INSERT INTO works(
+                                 work_key, author_norm, series_norm, series_index_norm, title_norm,
+                                 display_author, display_series, display_series_index, display_title
+                               ) VALUES(?,?,?,?,?,?,?,?,?)
+                               ON CONFLICT(work_key) DO UPDATE SET
+                                 author_norm=excluded.author_norm,
+                                 series_norm=excluded.series_norm,
+                                 series_index_norm=excluded.series_index_norm,
+                                 title_norm=excluded.title_norm""",
+                            (
+                                parsed.work_key, parsed.author_norm, parsed.series_norm,
+                                series_index_norm, parsed.title_norm,
+                                parsed.author, parsed.series or "",
+                                str(parsed.series_index or ""), parsed.title,
+                            ),
+                        )
+                    except Exception:
+                        st["errors"] = st.get("errors", 0) + 1
+                        logger.error("Reparse failed for file id=%s path=%r:\n%s",
+                                     fid, path, traceback.format_exc())
+                        self.progress.emit(f"Reparse: error on file id={fid} path={path!r} (skipped)")
+                        continue
+
+                    st["processed"] += 1
+
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                raise
+
+            processed += len(rows)
+            pct = int(processed * 100 / total) if total else 100
+            self.progress.emit(f"Reparse: {processed}/{total} ({pct}%)")
+            self.stats.emit(st.copy())
+
+        if self._stop:
+            return False, "Reparse aborted by user."
+
+        # Phase 3 — reset analysis state so next Analyze is fresh
+        self.progress.emit("Reparse: clearing analysis state…")
+        self.db.begin()
+        try:
+            self.db.execute("DELETE FROM deletion_queue")
+            self.db.execute("DELETE FROM tentative_authors")
+            self.db.execute("DELETE FROM author_variants")
+            self.db.set_state("analyze_phase", "")
+            self.db.set_state("analyze_progress", "")
+            self.db.set_state("analyze_completed", "")
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
+
+        errors = st.get("errors", 0)
+        suffix = f" ({errors} errors skipped)" if errors else ""
+        self.progress.emit(f"Reparse complete: {processed} files re-parsed.{suffix}")
+        return True, f"Reparse complete: {processed} files re-parsed.{suffix}"
